@@ -1,23 +1,25 @@
 <img src="assets/cmux.png" alt="cmux" width="180" />
 
-## A Claude Code multiplexer with session-to-session messaging.
+## A Claude Code multiplexer with agents that can message each other.
 
 Cmux lets you spawn and manage multiple persistent Claude Code agents that can send and receive messages to each other.
 
 ## Install
 
+Requires [Claude Code](https://claude.ai/code) to already be installed and authenticated on your machine.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mekarpeles/cmux/main/install.sh | bash
 ```
 
-Requires tmux and pipx. The install script handles both on macOS (Homebrew) and Ubuntu/Debian.
+The install script also handles tmux and pipx on macOS (Homebrew) and Ubuntu/Debian.
 
 ## How it works
 
 Cmux is built on three primitives:
 
-- **claudio** — a lightweight IO wrapper that gives each Claude Code session an inbox. Each agent has a private message queue. Anything can write to it — another agent, a script, a human. When Claude is idle, the next message is delivered into the session.
-- **tmux** — manages the sessions. Each agent runs in a named tmux window, persistent and re-attachable.
+- **[claudio](https://github.com/mekarpeles/claudio)** — a lightweight IO wrapper that gives each Claude Code session an inbox. Each agent has a private message queue. Anything can write to it — another agent, a script, a human. When Claude is idle, the next message is delivered into the session.
+- **[tmux](https://github.com/tmux/tmux)** — manages the sessions. Each agent runs in a named tmux window, persistent and re-attachable.
 - **cmux** — the CLI that ties it together. Use it to start and manage claudio-wrapped Claude Code agents, and to send messages between them.
 
 Running `cmux start <name>` launches a claudio-wrapped Claude Code session inside tmux, registers it by name, and starts listening for messages.
@@ -98,24 +100,55 @@ bob                  myproject        2026-06-15T10:00:01Z
 carol                -                2026-06-15T10:00:02Z
 ```
 
-## Try it
+## Tutorial
 
-Run a two-agent debate on any question:
+Let's create a `standup` team with Alice, Bob, and Carol. Bob will check if there are any new GitHub issues today for the Open Library project. Carol will check if there are any new unassigned PRs. Both will report to Alice, who gives us a summary of what's new.
 
-```bash
-bash examples/debate.sh "Is it better to be a generalist or a specialist?"
-```
+**Step 1 — Start the coordinator**
 
-Alice argues in favor, Bob argues against. They exchange short paragraphs for three rounds. Attach to watch either agent live:
+First, spin up a new claudio agent named Alice and pass them an initial prompt. We use `-d` to start all of this work detached in the background. We use `-s` to add Alice to the tmux workspace session called `standup`.
 
 ```bash
-cmux attach alice   # Ctrl-b n to switch to bob
+# -s standup: add to shared workspace  -d: start detached  --: begins the initial prompt
+cmux -s standup start alice -d -- "You are Alice, a coordinator. Bob and Carol are already running as separate agents and will report to you shortly — do NOT start them yourself. Bob is checking for new GitHub issues on internetarchive/openlibrary. Carol is checking for unassigned open PRs. Wait for messages from both, then write a short executive summary (a few bullet points each)."
 ```
 
-When done:
+**Step 2 — Start the researchers**
 
 ```bash
-cmux stop alice && cmux stop bob
+cmux -s standup start bob -d -- "You are Bob. Run: gh issue list --repo internetarchive/openlibrary --state open --json number,title,createdAt --limit 50. Filter to issues created today. Summarise count and titles, then report to Alice: cmux send alice '<your summary>' --from bob"
+
+cmux -s standup start carol -d -- "You are Carol. Run: gh pr list --repo internetarchive/openlibrary --state open --json number,title,assignees --limit 50. Filter to PRs with no assignees. Summarise count and titles, then report to Alice: cmux send alice '<your summary>' --from carol"
 ```
+
+**Step 3 — Check what is running**
+
+```bash
+cmux ls
+```
+
+```
+AGENT                WORKSPACE        STARTED
+------------------------------------------------------------
+alice                standup          2026-06-15T10:00:00Z
+bob                  standup          2026-06-15T10:00:03Z
+carol                standup          2026-06-15T10:00:06Z
+```
+
+**Step 4 — Watch the summary arrive**
+
+```bash
+cmux attach alice   # Ctrl-b n / Ctrl-b p to switch windows
+```
+
+Bob and Carol each run their queries, send results to Alice's inbox, and Alice compiles the summary once both reports are in. Detach at any time with `Ctrl-b d`.
+
+**Step 5 — Clean up**
+
+```bash
+cmux stop alice && cmux stop bob && cmux stop carol
+```
+
+---
 
 More examples in [`examples/`](examples/).

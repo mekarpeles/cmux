@@ -142,10 +142,13 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
     # Wait for daemon socket to be ready, then enqueue startup messages
     _wait_for_socket(reg[name]['socket'])
     cmux_info = (
-        f'You are running as a wrapped Claude session named "{name}". '
-        f'Other agents can reach you with: cmux send {name} "<message>". '
-        f'You can reach other agents with: cmux send <name> "<message>". '
-        f'Run `cmux ls` to see all running sessions.'
+        f'You are a cmux agent named "{name}". '
+        f'Messages from other agents arrive in the format [sender@cmux]: <message>. '
+        f'To reply or message another agent, run this bash command: '
+        f'cmux send <agent-name> "<your message>" --from {name}. '
+        f'To see all running agents: cmux ls. '
+        f'Do NOT use cmux start — you are not responsible for starting other agents. '
+        f'Simply do your work and use cmux send to communicate.'
     )
     cmd_send(name, cmux_info, sender='cmux')
     if initial_prompt:
