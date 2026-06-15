@@ -86,7 +86,7 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
     reg = load_registry()
 
     if name in reg and session_alive(reg[name]):
-        print(f"cmux: '{name}' already running — attaching")
+        print(f"cmux: agent '{name}' already running — attaching")
         if not detach:
             cmd_attach(name)
         return
@@ -151,16 +151,16 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
         cmd_send(name, initial_prompt, sender='user')
 
     if detach:
-        print(f"cmux: started '{name}'  (cmux attach {name} to open)")
+        print(f"cmux: agent '{name}' started  (cmux attach {name} to open)")
     else:
         cmd_attach(name)
 
 
 def cmd_ls():
-    """List all cmux sessions, grouped by workspace, pruning dead ones."""
+    """List all agents, pruning dead ones."""
     reg = load_registry()
     if not reg:
-        print('No sessions.')
+        print('No agents running.')
         return
 
     dead = [n for n, info in reg.items() if not session_alive(info)]
@@ -170,23 +170,14 @@ def cmd_ls():
     if dead:
         save_registry(reg)
     if not reg:
-        print('No sessions.')
+        print('No agents running.')
         return
 
-    # Group by workspace (None = standalone)
-    workspaces = {}
-    for name, info in reg.items():
-        ws = info.get('workspace')
-        workspaces.setdefault(ws, []).append(info)
-
-    for ws, sessions in sorted(workspaces.items(), key=lambda x: (x[0] is not None, x[0])):
-        if ws:
-            print(f'workspace: {ws}')
-            for info in sessions:
-                print(f'  {info["name"]:<18} running  {info.get("started", "")}')
-        else:
-            for info in sessions:
-                print(f'{info["name"]:<20} running  {info.get("started", "")}')
+    print(f'{"AGENT":<20} {"WORKSPACE":<16} STARTED')
+    print('-' * 60)
+    for name, info in sorted(reg.items(), key=lambda x: (x[1].get('workspace') or '', x[0])):
+        ws = info.get('workspace') or '-'
+        print(f'{name:<20} {ws:<16} {info.get("started", "")}')
 
 
 def cmd_send(name, message, sender=None):
@@ -208,7 +199,7 @@ def cmd_send(name, message, sender=None):
         s.close()
         result = json.loads(ack) if ack else {}
         if result.get('ok'):
-            print(f"cmux: queued for '{name}'")
+            print(f"cmux: message queued for agent '{name}'")
         else:
             print(f"cmux: daemon error — {result.get('error', 'unknown')}", file=sys.stderr)
             sys.exit(1)
@@ -238,7 +229,7 @@ def cmd_detach(name):
         sys.exit(1)
     tmux_sess = reg[name].get('tmux_session', f'cmux-{name}')
     subprocess.run(['tmux', 'detach-client', '-s', tmux_sess], check=True)
-    print(f"cmux: detached all clients from '{name}'")
+    print(f"cmux: detached from agent '{name}'")
 
 
 def cmd_stop(name):
@@ -271,7 +262,7 @@ def cmd_stop(name):
     _cleanup_files(name)
     del reg[name]
     save_registry(reg)
-    print(f"cmux: stopped '{name}'")
+    print(f"cmux: agent '{name}' stopped")
 
 
 # ------------------------------------------------------------------
@@ -279,32 +270,32 @@ def cmd_stop(name):
 # ------------------------------------------------------------------
 
 USAGE = """\
-cmux — Claude multiplexer
+cmux — Claude Code multiplexer
 
 Usage:
-  cmux [-s workspace] <name>               Start session and attach (shorthand)
-  cmux [-s workspace] start <name> [-d] [-- "initial prompt"]  Start session
-  cmux ls                                   List sessions (grouped by workspace)
-  cmux send <name> <message> [--from X]    Enqueue a message
-  cmux attach <name>                        Attach terminal to session
-  cmux detach <name>                        Detach all clients (session keeps running)
-  cmux stop <name>                          Stop session (window only if in workspace)
+  cmux [-s workspace] <agent>               Start agent and attach (shorthand)
+  cmux [-s workspace] start <agent> [-d] [-- "initial prompt"]
+  cmux ls                                   List agents
+  cmux send <agent> <message> [--from X]   Enqueue a message to an agent
+  cmux attach <agent>                       Attach terminal to agent
+  cmux detach <agent>                       Detach (agent keeps running)
+  cmux stop <agent>                         Stop agent
 
-Workspaces group multiple agents into one tmux session as windows/tabs:
-  cmux -s loopy start lupus -d
-  cmux -s loopy start slater -d
-  cmux attach lupus                         Opens loopy session on the lupus window
+Workspaces group agents into one tmux session as windows/tabs:
+  cmux -s myproject start alice -d
+  cmux -s myproject start bob -d
+  cmux attach alice                         Opens myproject on alice's window
 
 Keyboard shortcuts (when attached):
-  Ctrl-b d                                  Detach from session (keeps it running)
-  Ctrl-b n / Ctrl-b p                       Next / previous window
+  Ctrl-b d                                  Detach
+  Ctrl-b n / Ctrl-b p                       Next / previous agent window
   Ctrl-b [                                  Scroll mode (q to exit)
 """
 
 
 def _require_tmux():
     if subprocess.run(['which', 'tmux'], capture_output=True).returncode != 0:
-        print('cmux: tmux is required but not found. Install it with: brew install tmux', file=sys.stderr)
+        print('cmux: tmux is required but not found — install with: brew install tmux', file=sys.stderr)
         sys.exit(1)
 
 
