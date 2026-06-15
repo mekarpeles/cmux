@@ -98,6 +98,24 @@ bob                  myproject        2026-06-15T10:00:01Z
 carol                -                2026-06-15T10:00:02Z
 ```
 
-## Preview
+## Try it
 
-*Coming soon.*
+Run a two-agent debate on any question:
+
+```bash
+bash examples/debate.sh "Is it better to be a generalist or a specialist?"
+```
+
+Alice argues in favor, Bob argues against. They exchange short paragraphs for three rounds. Attach to watch either agent live:
+
+```bash
+cmux attach alice   # Ctrl-b n to switch to bob
+```
+
+When done:
+
+```bash
+cmux stop alice && cmux stop bob
+```
+
+More examples in [`examples/`](examples/).
