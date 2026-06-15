@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 
-STATE_DIR = os.path.expanduser('~/.cmux')
+STATE_DIR = os.environ.get('CMUX_STATE_DIR', os.path.expanduser('~/.cmux'))
 REGISTRY = os.path.join(STATE_DIR, 'sessions.json')
 
 
@@ -94,7 +94,8 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
     tmux_sess = _tmux_session(name, workspace)
     target = _tmux_target(name, workspace)
 
-    claude_cmd = f'CMUX_SESSION_NAME={name} claude'
+    claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
+    claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin}'
 
     os.makedirs(STATE_DIR, exist_ok=True)
 
