@@ -64,15 +64,7 @@ def socket_path(name):
     return os.path.join(STATE_DIR, f'{name}.sock')
 
 
-CMUX_INFO = """\
-[cmux] You are running as a wrapped Claude session named "{name}".
-Other agents can reach you with: cmux send {name} "<message>"
-You can reach other agents with: cmux send <name> "<message>"
-Run `cmux ls` to see all running sessions.\
-"""
-
-
-def run(name, tmux_target=None, initial_prompt=None):
+def run(name, tmux_target=None):
     if tmux_target is None:
         tmux_target = f'cmux-{name}:{name}'
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -84,11 +76,6 @@ def run(name, tmux_target=None, initial_prompt=None):
 
     queue = deque()
     lock = threading.Lock()
-
-    # Prepopulate with startup messages (processed before any external messages)
-    queue.append({'from': 'cmux', 'body': CMUX_INFO.format(name=name)})
-    if initial_prompt:
-        queue.append({'from': 'user', 'body': initial_prompt})
 
     # --- Socket server thread ---
     def serve():
@@ -133,10 +120,6 @@ def run(name, tmux_target=None, initial_prompt=None):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print('usage: python3 -m cmux_lib.daemon <name> [tmux-target] [initial-prompt]', file=sys.stderr)
+        print('usage: python3 -m cmux_lib.daemon <name> [tmux-target]', file=sys.stderr)
         sys.exit(1)
-    run(
-        sys.argv[1],
-        sys.argv[2] if len(sys.argv) > 2 else None,
-        sys.argv[3] if len(sys.argv) > 3 else None,
-    )
+    run(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)

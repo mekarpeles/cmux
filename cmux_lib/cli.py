@@ -67,6 +67,20 @@ def session_alive(info):
 # Commands
 # ------------------------------------------------------------------
 
+def _wait_for_socket(sock_path, timeout=10):
+    """Block until the daemon's socket is accepting connections."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(sock_path)
+            s.close()
+            return
+        except OSError:
+            time.sleep(0.1)
+    raise RuntimeError(f'cmux: daemon socket never became ready: {sock_path}')
+
+
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
     """Start a new cmux session (window). Attaches immediately unless --detach."""
     reg = load_registry()
@@ -102,11 +116,8 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
 
     daemon_log = os.path.join(STATE_DIR, f'{name}.daemon.log')
     daemon_pid_file = os.path.join(STATE_DIR, f'{name}.daemon.pid')
-    daemon_args = [sys.executable, '-m', 'cmux_lib.daemon', name, target]
-    if initial_prompt:
-        daemon_args.append(initial_prompt)
     daemon_proc = subprocess.Popen(
-        daemon_args,
+        [sys.executable, '-m', 'cmux_lib.daemon', name, target],
         stdout=open(daemon_log, 'w'),
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -126,6 +137,18 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
         'initial_prompt': initial_prompt,
     }
     save_registry(reg)
+
+    # Wait for daemon socket to be ready, then enqueue startup messages
+    _wait_for_socket(reg[name]['socket'])
+    cmux_info = (
+        f'You are running as a wrapped Claude session named "{name}". '
+        f'Other agents can reach you with: cmux send {name} "<message>". '
+        f'You can reach other agents with: cmux send <name> "<message>". '
+        f'Run `cmux ls` to see all running sessions.'
+    )
+    cmd_send(name, cmux_info, sender='cmux')
+    if initial_prompt:
+        cmd_send(name, initial_prompt, sender='user')
 
     if detach:
         print(f"cmux: started '{name}'  (cmux attach {name} to open)")
