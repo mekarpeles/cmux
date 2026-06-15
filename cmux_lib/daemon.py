@@ -34,9 +34,9 @@ def make_is_idle(target: str):
 
 def make_deliver(target: str):
     def deliver(msg: dict) -> None:
-        sender = msg.get('from', 'unknown')
-        label = f'[{sender}@cmux]' if sender != 'cmux' else '[cmux]'
-        text = f'{label}: {msg["body"]}'
+        sender = msg.get('from')
+        label = f'[{sender}@cmux]: ' if sender and sender != 'cmux' else ''
+        text = f'{label}{msg["body"]}'
         subprocess.run(['tmux', 'send-keys', '-t', target, text])
         subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
     return deliver
