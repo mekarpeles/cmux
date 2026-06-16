@@ -45,7 +45,10 @@ def make_deliver(target: str):
     def deliver(msg: dict) -> None:
         sender = msg.get('from')
         label = f'[{sender}@cmux]: ' if sender and sender != 'cmux' else ''
-        text = f'{label}{msg["body"]}'
+        # tmux send-keys treats \n as Enter, which would split one message into
+        # multiple submissions. Collapse newlines to spaces before injecting.
+        body = msg["body"].replace('\n', ' ')
+        text = f'{label}{body}'
         subprocess.run(['tmux', 'send-keys', '-t', target, text])
         subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
     return deliver

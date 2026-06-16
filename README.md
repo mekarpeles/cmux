@@ -110,15 +110,15 @@ First, spin up a new claudio agent named Alice and pass them an initial prompt. 
 
 ```bash
 # -s demo: add to shared workspace  -d: start detached  --: begins the initial prompt
-cmux -s demo start alice -d -- "You are Alice, running as a claudio session in cmux. Your role is to demo project coordination. Bob and Carol are also cmux claudio agents that will join us shortly. Bob will check for new GitHub issues on internetarchive/openlibrary. Carol will be checking for unassigned open PRs. Do not poll, do not run any commands — wait for cmux messages from Bob and Carol to arrive. Once you have both reports, present a short executive summary (a few bullet points each) directly in your window for the user to read. Do not use cmux to message anyone — your output is for the user, not another agent. You may message Bob or Carol if you need clarification."
+cmux -s demo start alice -d -- "Hi Alice, you are today's project coordination for our cmux demo. Bob and Carol are cmux agents that will ping us shortly. Bob will check for new GitHub issues on internetarchive/openlibrary and Carol will check for new unassigned open PRs. Do not poll or run any commands — wait for cmux messages from Bob and Carol to arrive. Once you have both reports, present a short executive summary (a few bullet points each) directly in your window for the user to read."
 ```
 
 **Step 2 — Start the researchers**
 
 ```bash
-cmux -s demo start bob -d -- "You are Bob. Run: gh issue list --repo internetarchive/openlibrary --state open --json number,title,createdAt --limit 50. Filter to issues created today. Summarise count and titles, then report to Alice: cmux send alice '<your summary>' --from bob"
+cmux -s demo start bob -d -- "You are Bob. Run: gh issue list --repo internetarchive/openlibrary --state open --json number,title,createdAt --limit 50. Filter to issues created today. Summarise count and titles, then report to Alice: cmux send alice '<your summary>'"
 
-cmux -s demo start carol -d -- "You are Carol. Run: gh pr list --repo internetarchive/openlibrary --state open --json number,title,assignees --limit 50. Filter to PRs with no assignees. Summarise count and titles, then report to Alice: cmux send alice '<your summary>' --from carol"
+cmux -s demo start carol -d -- "You are Carol. Run: gh pr list --repo internetarchive/openlibrary --state open --json number,title,assignees --limit 50. Filter to PRs with no assignees. Summarise count and titles, then report to Alice: cmux send alice '<your summary>'"
 ```
 
 **Step 3 — Check what is running**
