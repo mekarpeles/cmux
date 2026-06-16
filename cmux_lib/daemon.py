@@ -23,22 +23,24 @@ def pane_content(target: str) -> str:
     return result.stdout
 
 
-def make_is_idle(target: str):
+def make_is_idle(target: str, stable_for: float = 1.0):
+    """Require cursor_x to stay at the idle position for `stable_for` seconds.
+
+    Claude Code's TUI does not render keystrokes to the tmux scroll buffer, so
+    pane content cannot detect in-progress input. cursor_x is the only reliable
+    signal, but Ctrl-A / Home momentarily move the cursor back to the idle
+    position. Requiring stability over time prevents injection during navigation.
+    """
+    _idle_since: list = [None]
+
     def is_idle() -> bool:
-        # First check: is the ❯ prompt even visible? If not, Claude is generating.
+        # Prompt must be visible — if not, Claude is generating.
         content = pane_content(target)
-        last_prompt = None
-        for line in content.split('\n'):
-            stripped = line.lstrip()
-            if stripped.startswith('❯'):
-                last_prompt = stripped
-        if last_prompt is None:
+        has_prompt = any(line.lstrip().startswith('❯') for line in content.split('\n'))
+        if not has_prompt:
+            _idle_since[0] = None
             return False
 
-        # Second check: cursor position. When the user is typing, the cursor moves
-        # right of the ❯ prompt. Claude Code's TUI may not flush keystrokes to the
-        # scroll buffer immediately, so pane content alone can miss in-progress input.
-        # cursor_x > 2 reliably indicates the user has typed something after ❯.
         result = subprocess.run(
             ['tmux', 'display-message', '-t', target, '-p', '#{cursor_x}'],
             capture_output=True, text=True,
@@ -47,14 +49,19 @@ def make_is_idle(target: str):
             cursor_x = int(result.stdout.strip())
         except ValueError:
             cursor_x = 0
-        # Third check: pane content after ❯. Idle if empty or NBSP ghost hint only.
-        # This must run even when cursor_x <= 2 — the cursor can be at column 0
-        # if the user pressed Home/Ctrl-A to move to the start of a non-empty line.
-        after = last_prompt[1:]
-        content_empty = after == '' or after[0:1] == '\xa0'
 
-        # Both must agree: cursor at rest AND no visible input text.
-        return cursor_x <= 2 and content_empty
+        if cursor_x > 2:
+            _idle_since[0] = None
+            return False
+
+        # cursor_x <= 2: start or continue stability timer.
+        now = time.monotonic()
+        if _idle_since[0] is None:
+            _idle_since[0] = now
+            return False
+
+        return (now - _idle_since[0]) >= stable_for
+
     return is_idle
 
 
