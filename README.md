@@ -102,23 +102,23 @@ carol                -                2026-06-15T10:00:02Z
 
 ## Tutorial
 
-Let's create a `standup` team with Alice, Bob, and Carol. Bob will check if there are any new GitHub issues today for the Open Library project. Carol will check if there are any new unassigned PRs. Both will report to Alice, who gives us a summary of what's new.
+Let's create a `demo` team with Alice, Bob, and Carol. Bob will check if there are any new GitHub issues today for the Open Library project. Carol will check if there are any new unassigned PRs. Both will report to Alice, who gives us a summary of what's new.
 
 **Step 1 — Start the coordinator**
 
-First, spin up a new claudio agent named Alice and pass them an initial prompt. We use `-d` to start all of this work detached in the background. We use `-s` to add Alice to the tmux workspace session called `standup`.
+First, spin up a new claudio agent named Alice and pass them an initial prompt. We use `-d` to start all of this work detached in the background. We use `-s` to add Alice to the tmux workspace session called `demo`.
 
 ```bash
-# -s standup: add to shared workspace  -d: start detached  --: begins the initial prompt
-cmux -s standup start alice -d -- "You are Alice, a coordinator. Bob and Carol are already running as separate agents and will report to you shortly — do NOT start them yourself. Bob is checking for new GitHub issues on internetarchive/openlibrary. Carol is checking for unassigned open PRs. Wait for messages from both, then write a short executive summary (a few bullet points each)."
+# -s demo: add to shared workspace  -d: start detached  --: begins the initial prompt
+cmux -s demo start alice -d -- "You are Alice, running as a claudio session in cmux. Your role is to demo project coordination. Bob and Carol are also cmux claudio agents that will join us shortly. Bob will check for new GitHub issues on internetarchive/openlibrary. Carol will be checking for unassigned open PRs. Do not poll, do not run any commands — wait for cmux messages from Bob and Carol to arrive. Once you have both reports, present a short executive summary (a few bullet points each) directly in your window for the user to read. Do not use cmux to message anyone — your output is for the user, not another agent. You may message Bob or Carol if you need clarification."
 ```
 
 **Step 2 — Start the researchers**
 
 ```bash
-cmux -s standup start bob -d -- "You are Bob. Run: gh issue list --repo internetarchive/openlibrary --state open --json number,title,createdAt --limit 50. Filter to issues created today. Summarise count and titles, then report to Alice: cmux send alice '<your summary>' --from bob"
+cmux -s demo start bob -d -- "You are Bob. Run: gh issue list --repo internetarchive/openlibrary --state open --json number,title,createdAt --limit 50. Filter to issues created today. Summarise count and titles, then report to Alice: cmux send alice '<your summary>' --from bob"
 
-cmux -s standup start carol -d -- "You are Carol. Run: gh pr list --repo internetarchive/openlibrary --state open --json number,title,assignees --limit 50. Filter to PRs with no assignees. Summarise count and titles, then report to Alice: cmux send alice '<your summary>' --from carol"
+cmux -s demo start carol -d -- "You are Carol. Run: gh pr list --repo internetarchive/openlibrary --state open --json number,title,assignees --limit 50. Filter to PRs with no assignees. Summarise count and titles, then report to Alice: cmux send alice '<your summary>' --from carol"
 ```
 
 **Step 3 — Check what is running**
@@ -130,9 +130,9 @@ cmux ls
 ```
 AGENT                WORKSPACE        STARTED
 ------------------------------------------------------------
-alice                standup          2026-06-15T10:00:00Z
-bob                  standup          2026-06-15T10:00:03Z
-carol                standup          2026-06-15T10:00:06Z
+alice                demo          2026-06-15T10:00:00Z
+bob                  demo          2026-06-15T10:00:03Z
+carol                demo          2026-06-15T10:00:06Z
 ```
 
 **Step 4 — Watch the summary arrive**
