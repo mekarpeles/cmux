@@ -25,10 +25,19 @@ def pane_content(target: str) -> str:
 
 def make_is_idle(target: str):
     def is_idle() -> bool:
+        # Find the last ❯ line — it's the current prompt (Claude's TUI keeps it at the bottom).
+        # Earlier ❯ lines may contain previously-injected text and should be ignored.
+        last_prompt = None
         for line in pane_content(target).split('\n'):
-            if line.lstrip().startswith('❯'):
-                return True
-        return False
+            stripped = line.lstrip()
+            if stripped.startswith('❯'):
+                last_prompt = stripped
+        if last_prompt is None:
+            return False
+        after = last_prompt[1:]
+        # Idle if nothing follows ❯, or if the next char is NBSP (\xa0) — that's
+        # Claude Code's ghost/placeholder hint, not user input.
+        return after == '' or after[0:1] == '\xa0'
     return is_idle
 
 

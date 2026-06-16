@@ -9,5 +9,7 @@ import sys
 import time
 
 while True:
-    print('\n❯ ', end='', flush=True)
+    # Mimic Claude Code's real idle prompt: ❯ followed by NBSP + ghost hint text.
+    # This is what tmux capture-pane sees in a real session.
+    print('\n❯\xa0Try "create a util logging.py that..."', end='', flush=True)
     time.sleep(1)
