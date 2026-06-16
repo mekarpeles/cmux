@@ -143,16 +143,19 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
     _wait_for_socket(reg[name]['socket'])
     cmux_info = (
         f'You are a cmux agent named "{name}". '
-        f'Messages from other agents arrive in the format [sender@cmux]: <message>. '
-        f'To reply or message another agent, run this bash command: '
+        f'Wait for instructions before doing anything — do not introduce yourself, '
+        f'send messages, or take any action until you receive a task. '
+        f'When other agents message you, their messages arrive in the format [sender@cmux]: <message>. '
+        f'To message another agent, run this bash command: '
         f'cmux send <agent-name> "<your message>" --from {name}. '
-        f'To see all running agents: cmux ls. '
-        f'Do NOT use cmux start — you are not responsible for starting other agents. '
-        f'Simply do your work and use cmux send to communicate.'
+        f'To see all running agents, run: cmux ls. '
+        f'Do NOT use `cmux start` unless instructed — you are not responsible for starting other agents. '
+        f'Run cmux without arguments to see full usage.'
     )
-    cmd_send(name, cmux_info, sender='cmux')
     if initial_prompt:
-        cmd_send(name, initial_prompt, sender='user')
+        cmd_send(name, f'{cmux_info}\n\n{initial_prompt}', sender='cmux')
+    else:
+        cmd_send(name, cmux_info, sender='cmux')
 
     if detach:
         print(f"cmux: agent '{name}' started  (cmux attach {name} to open)")
