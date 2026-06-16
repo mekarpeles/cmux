@@ -84,7 +84,32 @@ def make_deliver_file(name: str):
     return deliver
 
 
+def _check_singleton(name: str) -> None:
+    """Exit if a daemon for this agent is already running."""
+    pid_file = os.path.join(STATE_DIR, f'{name}.daemon.pid')
+    try:
+        existing_pid = int(open(pid_file).read().strip())
+        # Check if process is actually alive
+        os.kill(existing_pid, 0)
+        print(
+            f'cmux: daemon for {name!r} already running (pid {existing_pid}). '
+            f'Stop it first: cmux stop {name}',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except (FileNotFoundError, ValueError):
+        pass  # no pid file — first start
+    except ProcessLookupError:
+        pass  # stale pid file — process is gone, safe to proceed
+
+    # Write our own PID
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(pid_file, 'w') as f:
+        f.write(str(os.getpid()))
+
+
 def run(name: str, tmux_target: str = None, no_inject: bool = False) -> None:
+    _check_singleton(name)
     if tmux_target is None:
         tmux_target = f'cmux-{name}:{name}'
     if no_inject:
