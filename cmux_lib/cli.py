@@ -9,6 +9,7 @@ import time
 
 STATE_DIR = os.environ.get('CMUX_STATE_DIR', os.path.expanduser('~/.cmux'))
 REGISTRY = os.path.join(STATE_DIR, 'sessions.json')
+MAX_MESSAGE_LEN = 2000
 
 
 # ------------------------------------------------------------------
@@ -81,7 +82,29 @@ def _wait_for_socket(sock_path, timeout=10):
     raise RuntimeError(f'cmux: daemon socket never became ready: {sock_path}')
 
 
-def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
+def cmd_inbox(name):
+    """Print and clear all queued messages for a --no-inject agent."""
+    inbox_path = os.path.join(STATE_DIR, f'{name}.inbox.jsonl')
+    try:
+        lines = open(inbox_path).readlines()
+    except FileNotFoundError:
+        print(f'cmux: no inbox for {name!r} (not a --no-inject agent, or no messages yet)')
+        return
+    if not lines:
+        print(f'cmux: inbox for {name!r} is empty')
+        return
+    for line in lines:
+        try:
+            msg = json.loads(line)
+            sender = msg.get('from', '?')
+            print(f'[{sender}@cmux]: {msg["body"]}')
+        except Exception:
+            print(line, end='')
+    # Clear after reading
+    open(inbox_path, 'w').close()
+
+
+def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False):
     """Start a new cmux session (window). Attaches immediately unless --detach."""
     reg = load_registry()
 
@@ -117,8 +140,11 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
 
     daemon_log = os.path.join(STATE_DIR, f'{name}.daemon.log')
     daemon_pid_file = os.path.join(STATE_DIR, f'{name}.daemon.pid')
+    daemon_args = [sys.executable, '-m', 'cmux_lib.daemon', name, target]
+    if no_inject:
+        daemon_args.append('--no-inject')
     daemon_proc = subprocess.Popen(
-        [sys.executable, '-m', 'cmux_lib.daemon', name, target],
+        daemon_args,
         stdout=open(daemon_log, 'w'),
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -136,6 +162,7 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
         'daemon_pid': daemon_proc.pid,
         'started': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'initial_prompt': initial_prompt,
+        'no_inject': no_inject,
     }
     save_registry(reg)
 
@@ -145,12 +172,12 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None):
         f'You are a cmux agent named "{name}". '
         f'Wait for instructions before doing anything — do not introduce yourself, '
         f'send messages, or take any action until you receive a task. '
-        f'When other agents message you, their messages arrive in the format [sender@cmux]: <message>. '
-        f'To message another agent, run this bash command: '
-        f'cmux send <agent-name> "<your message>" --from {name}. '
+        f'Messages from other agents are delivered to you automatically when you are idle — '
+        f'you do NOT need to poll, fetch, or receive them. They arrive as: [sender@cmux]: <message>. '
+        f'To message another agent, run: cmux send <agent-name> "<your message>". '
+        f'Your name ("{name}") is already known from your environment — do NOT pass --from. '
         f'To see all running agents, run: cmux ls. '
-        f'Do NOT use `cmux start` unless instructed — you are not responsible for starting other agents. '
-        f'Run cmux without arguments to see full usage.'
+        f'Do NOT use `cmux start` unless instructed — you are not responsible for starting other agents.'
     )
     if initial_prompt:
         cmd_send(name, f'{cmux_info}\n\n{initial_prompt}', sender='cmux')
@@ -192,6 +219,14 @@ def cmd_send(name, message, sender=None):
     reg = load_registry()
     if name not in reg:
         print(f"cmux: no session '{name}'", file=sys.stderr)
+        sys.exit(1)
+
+    if len(message) > MAX_MESSAGE_LEN:
+        print(
+            f"cmux: message too long ({len(message)} chars, limit {MAX_MESSAGE_LEN}). "
+            f"Split into multiple messages.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if not sender:
@@ -281,12 +316,18 @@ cmux — Claude Code multiplexer
 
 Usage:
   cmux [-s workspace] <agent>               Start agent and attach (shorthand)
-  cmux [-s workspace] start <agent> [-d] [-- "initial prompt"]
+  cmux [-s workspace] start <agent> [-d] [--no-inject] [-- "initial prompt"]
   cmux ls                                   List agents
-  cmux send <agent> <message> [--from X]   Enqueue a message to an agent
+  cmux send <agent> <message>               Enqueue a message (max 2000 chars)
   cmux attach <agent>                       Attach terminal to agent
   cmux detach <agent>                       Detach (agent keeps running)
   cmux stop <agent>                         Stop agent
+  cmux inbox <agent>                        Print and clear queued messages (--no-inject agents)
+
+Flags:
+  --no-inject   Messages are written to a file instead of injected via tmux send-keys.
+                Use for coordinator sessions (e.g. lupus) where a human is actively typing
+                in the pane. Read messages with: cmux inbox <agent>
 
 Workspaces group agents into one tmux session as windows/tabs:
   cmux -s myproject start alice -d
@@ -326,7 +367,7 @@ def main():
     cmd = args[0]
 
     # Shorthand: `cmux [-s ws] lupus` → start + attach
-    if cmd not in ('start', 'ls', 'send', 'attach', 'detach', 'stop'):
+    if cmd not in ('start', 'ls', 'send', 'attach', 'detach', 'stop', 'inbox'):
         if cmd.startswith('-'):
             print(f'cmux: unknown option {cmd!r}', file=sys.stderr)
             print(USAGE)
@@ -339,14 +380,15 @@ def main():
             print('cmux: start requires a session name', file=sys.stderr)
             sys.exit(1)
         detach = '-d' in args or '--detach' in args
-        remaining = [a for a in args[1:] if a not in ('-d', '--detach')]
+        no_inject = '--no-inject' in args
+        remaining = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject')]
         name = remaining[0]
         try:
             sep = remaining.index('--')
             initial_prompt = ' '.join(remaining[sep + 1:]) or None
         except ValueError:
             initial_prompt = None
-        cmd_start(name, initial_prompt=initial_prompt, detach=detach, workspace=workspace)
+        cmd_start(name, initial_prompt=initial_prompt, detach=detach, workspace=workspace, no_inject=no_inject)
 
     elif cmd == 'ls':
         cmd_ls()
@@ -374,6 +416,12 @@ def main():
             print('cmux: detach requires a session name', file=sys.stderr)
             sys.exit(1)
         cmd_detach(args[1])
+
+    elif cmd == 'inbox':
+        if len(args) < 2:
+            print('cmux: inbox requires a session name', file=sys.stderr)
+            sys.exit(1)
+        cmd_inbox(args[1])
 
     elif cmd == 'stop':
         if len(args) < 2:
