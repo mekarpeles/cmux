@@ -24,7 +24,7 @@ def pane_content(target: str) -> str:
     return result.stdout
 
 
-def make_is_idle(target: str, stable_for: float = 3.0):
+def make_is_idle(target: str, stable_for: float = 10.0):
     """Require cursor_x to stay at the idle position for `stable_for` seconds.
 
     Claude Code's TUI does not render keystrokes to the tmux scroll buffer, so
