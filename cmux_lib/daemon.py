@@ -47,12 +47,14 @@ def make_is_idle(target: str):
             cursor_x = int(result.stdout.strip())
         except ValueError:
             cursor_x = 0
-        if cursor_x > 2:
-            return False
-
         # Third check: pane content after ❯. Idle if empty or NBSP ghost hint only.
+        # This must run even when cursor_x <= 2 — the cursor can be at column 0
+        # if the user pressed Home/Ctrl-A to move to the start of a non-empty line.
         after = last_prompt[1:]
-        return after == '' or after[0:1] == '\xa0'
+        content_empty = after == '' or after[0:1] == '\xa0'
+
+        # Both must agree: cursor at rest AND no visible input text.
+        return cursor_x <= 2 and content_empty
     return is_idle
 
 
