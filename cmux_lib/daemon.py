@@ -9,6 +9,7 @@ Delivery injects messages via tmux send-keys.
 import os
 import subprocess
 import sys
+import time
 
 import claudio
 
@@ -54,7 +55,22 @@ def make_is_idle(target: str, stable_for: float = 1.0):
             _idle_since[0] = None
             return False
 
-        # cursor_x <= 2: start or continue stability timer.
+        # cursor_x <= 2 but check pane content — the NBSP ghost hint followed by
+        # real text means the user has typed something (❯\xa0hello world...).
+        last_prompt = None
+        for line in content.split('\n'):
+            stripped = line.lstrip()
+            if stripped.startswith('❯'):
+                last_prompt = stripped
+        if last_prompt:
+            after = last_prompt[1:]  # strip leading ❯
+            # \xa0 alone = empty ghost hint = idle
+            # \xa0 + more text = user has typed something
+            if after and after != '\xa0' and after.strip('\xa0') != '':
+                _idle_since[0] = None
+                return False
+
+        # cursor_x <= 2 and no typed content: start or continue stability timer.
         now = time.monotonic()
         if _idle_since[0] is None:
             _idle_since[0] = now
