@@ -25,18 +25,33 @@ def pane_content(target: str) -> str:
 
 def make_is_idle(target: str):
     def is_idle() -> bool:
-        # Find the last ❯ line — it's the current prompt (Claude's TUI keeps it at the bottom).
-        # Earlier ❯ lines may contain previously-injected text and should be ignored.
+        # First check: is the ❯ prompt even visible? If not, Claude is generating.
+        content = pane_content(target)
         last_prompt = None
-        for line in pane_content(target).split('\n'):
+        for line in content.split('\n'):
             stripped = line.lstrip()
             if stripped.startswith('❯'):
                 last_prompt = stripped
         if last_prompt is None:
             return False
+
+        # Second check: cursor position. When the user is typing, the cursor moves
+        # right of the ❯ prompt. Claude Code's TUI may not flush keystrokes to the
+        # scroll buffer immediately, so pane content alone can miss in-progress input.
+        # cursor_x > 2 reliably indicates the user has typed something after ❯.
+        result = subprocess.run(
+            ['tmux', 'display-message', '-t', target, '-p', '#{cursor_x}'],
+            capture_output=True, text=True,
+        )
+        try:
+            cursor_x = int(result.stdout.strip())
+        except ValueError:
+            cursor_x = 0
+        if cursor_x > 2:
+            return False
+
+        # Third check: pane content after ❯. Idle if empty or NBSP ghost hint only.
         after = last_prompt[1:]
-        # Idle if nothing follows ❯, or if the next char is NBSP (\xa0) — that's
-        # Claude Code's ghost/placeholder hint, not user input.
         return after == '' or after[0:1] == '\xa0'
     return is_idle
 
