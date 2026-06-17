@@ -68,12 +68,17 @@ def make_is_idle(target: str):
         if cursor_x > 2:
             return False
 
+        # Only check the LAST ❯ line — previous user messages in the scrollback
+        # also start with ❯ and would falsely indicate typing.
+        last_prompt = None
         for line in content.split('\n'):
             stripped = line.lstrip()
             if stripped.startswith('❯'):
-                after = stripped[1:]  # strip leading ❯
-                if after and after != '\xa0' and after.strip('\xa0') != '':
-                    return False  # user has typed something
+                last_prompt = stripped
+        if last_prompt is not None:
+            after = last_prompt[1:]
+            if after and after != '\xa0' and after.strip('\xa0') != '':
+                return False  # user has typed something
 
         return True
 
