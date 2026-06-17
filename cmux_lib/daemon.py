@@ -40,30 +40,23 @@ def prompt_area(target: str) -> str:
     return '\n'.join(lines[-4:]) if len(lines) >= 4 else result.stdout
 
 
-def make_is_idle(target: str, stable_for: float = 5.0):
-    """Inject only after the pane has been completely unchanged for stable_for seconds.
+def make_is_idle(target: str):
+    """Return True when the Claude session is idle: prompt visible, cursor at
+    start, nothing typed. Inject immediately — no timers, no hashing.
 
-    Tracks a hash of the full pane content. Any change — Claude generating, cursor
-    moving, user typing — resets the clock. This means:
-    - Claude generating: content changes constantly → never idle
-    - User typing: cursor_x > 2 resets clock; content check catches Ctrl-A case
-    - User just came back: first keystroke changes content and resets clock
-    - Genuinely idle (away from terminal): pane stable → inject after stable_for
-
-    The polling loop in claudio checks is_idle() every ~1s, so the effective
-    delay is stable_for + up to 1s poll jitter.
+    Three checks:
+    1. ❯ prompt is visible (Claude is waiting for input, not generating)
+    2. cursor_x <= 2 (cursor at the prompt position, not mid-typed-text)
+    3. No text after the ❯ ghost-hint (handles Ctrl-A: cursor moves to 0
+       but typed text is still in the buffer and visible in pane content)
     """
-    _last_content: list = [None]
-    _stable_since: list = [None]
-
     def is_idle() -> bool:
         content = pane_content(target)
-        area = prompt_area(target)  # bottom 4 lines only — stable while scrollback churns
 
-        # Prompt must be visible — if not, Claude is generating.
         has_prompt = any(line.lstrip().startswith('❯') for line in content.split('\n'))
+        if not has_prompt:
+            return False
 
-        # cursor_x > 2 means user is mid-line.
         result = subprocess.run(
             ['tmux', 'display-message', '-t', target, '-p', '#{cursor_x}'],
             capture_output=True, text=True,
@@ -72,39 +65,17 @@ def make_is_idle(target: str, stable_for: float = 5.0):
             cursor_x = int(result.stdout.strip())
         except ValueError:
             cursor_x = 0
-
-        # Check for typed text: ❯\xa0<text> means user has typed something.
-        has_typed = False
-        if has_prompt:
-            for line in content.split('\n'):
-                stripped = line.lstrip()
-                if stripped.startswith('❯'):
-                    after = stripped[1:]
-                    if after and after != '\xa0' and after.strip('\xa0') != '':
-                        has_typed = True
-                        break
-
-        # Any active signal resets the stability clock.
-        if not has_prompt or cursor_x > 2 or has_typed:
-            _last_content[0] = area
-            _stable_since[0] = None
+        if cursor_x > 2:
             return False
 
-        # Prompt area changed since last check — reset clock.
-        # Use prompt_area (bottom 4 lines) not full content, so the spinner/token
-        # counter in the scrollback doesn't prevent delivery while truly idle.
-        now = time.monotonic()
-        if area != _last_content[0]:
-            _last_content[0] = area
-            _stable_since[0] = now
-            return False
+        for line in content.split('\n'):
+            stripped = line.lstrip()
+            if stripped.startswith('❯'):
+                after = stripped[1:]  # strip leading ❯
+                if after and after != '\xa0' and after.strip('\xa0') != '':
+                    return False  # user has typed something
 
-        # Prompt area unchanged — start or continue stability window.
-        if _stable_since[0] is None:
-            _stable_since[0] = now
-            return False
-
-        return (now - _stable_since[0]) >= stable_for
+        return True
 
     return is_idle
 
