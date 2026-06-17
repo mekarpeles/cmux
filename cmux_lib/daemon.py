@@ -24,6 +24,22 @@ def pane_content(target: str) -> str:
     return result.stdout
 
 
+def prompt_area(target: str) -> str:
+    """Return only the bottom 4 lines of the pane — the prompt + status bar.
+
+    The scrollback above changes constantly while Claude is generating (spinner,
+    token counter). Tracking only the prompt area means the stability clock is
+    unaffected by active generation in the scrollback and only resets when the
+    prompt itself changes (user typing, cursor moving, new injection arriving).
+    """
+    result = subprocess.run(
+        ['tmux', 'capture-pane', '-t', target, '-p'],
+        capture_output=True, text=True,
+    )
+    lines = result.stdout.splitlines()
+    return '\n'.join(lines[-4:]) if len(lines) >= 4 else result.stdout
+
+
 def make_is_idle(target: str, stable_for: float = 5.0):
     """Inject only after the pane has been completely unchanged for stable_for seconds.
 
@@ -42,6 +58,7 @@ def make_is_idle(target: str, stable_for: float = 5.0):
 
     def is_idle() -> bool:
         content = pane_content(target)
+        area = prompt_area(target)  # bottom 4 lines only — stable while scrollback churns
 
         # Prompt must be visible — if not, Claude is generating.
         has_prompt = any(line.lstrip().startswith('❯') for line in content.split('\n'))
@@ -69,18 +86,20 @@ def make_is_idle(target: str, stable_for: float = 5.0):
 
         # Any active signal resets the stability clock.
         if not has_prompt or cursor_x > 2 or has_typed:
-            _last_content[0] = content
+            _last_content[0] = area
             _stable_since[0] = None
             return False
 
-        # Content changed since last check — reset clock.
+        # Prompt area changed since last check — reset clock.
+        # Use prompt_area (bottom 4 lines) not full content, so the spinner/token
+        # counter in the scrollback doesn't prevent delivery while truly idle.
         now = time.monotonic()
-        if content != _last_content[0]:
-            _last_content[0] = content
+        if area != _last_content[0]:
+            _last_content[0] = area
             _stable_since[0] = now
             return False
 
-        # Content unchanged — start or continue stability window.
+        # Prompt area unchanged — start or continue stability window.
         if _stable_since[0] is None:
             _stable_since[0] = now
             return False
