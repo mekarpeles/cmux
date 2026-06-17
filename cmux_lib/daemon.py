@@ -24,24 +24,29 @@ def pane_content(target: str) -> str:
     return result.stdout
 
 
-def make_is_idle(target: str, stable_for: float = 10.0):
-    """Require cursor_x to stay at the idle position for `stable_for` seconds.
+def make_is_idle(target: str, stable_for: float = 5.0):
+    """Inject only after the pane has been completely unchanged for stable_for seconds.
 
-    Claude Code's TUI does not render keystrokes to the tmux scroll buffer, so
-    pane content cannot detect in-progress input. cursor_x is the only reliable
-    signal, but Ctrl-A / Home momentarily move the cursor back to the idle
-    position. Requiring stability over time prevents injection during navigation.
+    Tracks a hash of the full pane content. Any change — Claude generating, cursor
+    moving, user typing — resets the clock. This means:
+    - Claude generating: content changes constantly → never idle
+    - User typing: cursor_x > 2 resets clock; content check catches Ctrl-A case
+    - User just came back: first keystroke changes content and resets clock
+    - Genuinely idle (away from terminal): pane stable → inject after stable_for
+
+    The polling loop in claudio checks is_idle() every ~1s, so the effective
+    delay is stable_for + up to 1s poll jitter.
     """
-    _idle_since: list = [None]
+    _last_content: list = [None]
+    _stable_since: list = [None]
 
     def is_idle() -> bool:
-        # Prompt must be visible — if not, Claude is generating.
         content = pane_content(target)
-        has_prompt = any(line.lstrip().startswith('❯') for line in content.split('\n'))
-        if not has_prompt:
-            _idle_since[0] = None
-            return False
 
+        # Prompt must be visible — if not, Claude is generating.
+        has_prompt = any(line.lstrip().startswith('❯') for line in content.split('\n'))
+
+        # cursor_x > 2 means user is mid-line.
         result = subprocess.run(
             ['tmux', 'display-message', '-t', target, '-p', '#{cursor_x}'],
             capture_output=True, text=True,
@@ -51,32 +56,36 @@ def make_is_idle(target: str, stable_for: float = 10.0):
         except ValueError:
             cursor_x = 0
 
-        if cursor_x > 2:
-            _idle_since[0] = None
+        # Check for typed text: ❯\xa0<text> means user has typed something.
+        has_typed = False
+        if has_prompt:
+            for line in content.split('\n'):
+                stripped = line.lstrip()
+                if stripped.startswith('❯'):
+                    after = stripped[1:]
+                    if after and after != '\xa0' and after.strip('\xa0') != '':
+                        has_typed = True
+                        break
+
+        # Any active signal resets the stability clock.
+        if not has_prompt or cursor_x > 2 or has_typed:
+            _last_content[0] = content
+            _stable_since[0] = None
             return False
 
-        # cursor_x <= 2 but check pane content — the NBSP ghost hint followed by
-        # real text means the user has typed something (❯\xa0hello world...).
-        last_prompt = None
-        for line in content.split('\n'):
-            stripped = line.lstrip()
-            if stripped.startswith('❯'):
-                last_prompt = stripped
-        if last_prompt:
-            after = last_prompt[1:]  # strip leading ❯
-            # \xa0 alone = empty ghost hint = idle
-            # \xa0 + more text = user has typed something
-            if after and after != '\xa0' and after.strip('\xa0') != '':
-                _idle_since[0] = None
-                return False
-
-        # cursor_x <= 2 and no typed content: start or continue stability timer.
+        # Content changed since last check — reset clock.
         now = time.monotonic()
-        if _idle_since[0] is None:
-            _idle_since[0] = now
+        if content != _last_content[0]:
+            _last_content[0] = content
+            _stable_since[0] = now
             return False
 
-        return (now - _idle_since[0]) >= stable_for
+        # Content unchanged — start or continue stability window.
+        if _stable_since[0] is None:
+            _stable_since[0] = now
+            return False
+
+        return (now - _stable_since[0]) >= stable_for
 
     return is_idle
 
