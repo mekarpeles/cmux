@@ -68,17 +68,20 @@ def make_is_idle(target: str):
         if cursor_x > 2:
             return False
 
-        # Only check the LAST ❯ line — previous user messages in the scrollback
-        # also start with ❯ and would falsely indicate typing.
-        last_prompt = None
-        for line in content.split('\n'):
-            stripped = line.lstrip()
-            if stripped.startswith('❯'):
-                last_prompt = stripped
-        if last_prompt is not None:
-            after = last_prompt[1:]
-            if after and after != '\xa0' and after.strip('\xa0') != '':
-                return False  # user has typed something
+        # cursor_x == 2: cursor is at the ghost-hint position.
+        # Any text visible after ❯ is a Claude Code UI hint, not user input.
+        # Only check for typed text when cursor_x == 0 (Ctrl-A moves cursor
+        # to the very start while leaving typed text in the buffer).
+        if cursor_x < 2:
+            last_prompt = None
+            for line in content.split('\n'):
+                stripped = line.lstrip()
+                if stripped.startswith('❯'):
+                    last_prompt = stripped
+            if last_prompt is not None:
+                after = last_prompt[1:]
+                if after and after != '\xa0' and after.strip('\xa0') != '':
+                    return False  # Ctrl-A case: text in buffer
 
         return True
 
