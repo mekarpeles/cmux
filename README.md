@@ -34,72 +34,6 @@ Many long-lived CLI tools (tmux, emacs) solve this by running as servers that cl
 
 Claude Code's experimental Agent Teams feature offers a related capability, but it is opinionated about orchestration and treats the multi-agent structure as a framework rather than a primitive. Cmux makes no assumptions about how agents relate to each other — it only gives each session an inbox and a name. You decide the topology. The goal is primitives and control.
 
-## Usage
-
-### Agents
-
-**Start an agent** (starts and attaches):
-```bash
-cmux alice
-```
-
-**Start detached, with an initial prompt:**
-```bash
-cmux start alice -d -- "You are Alice, a project coordinator."
-```
-
-**List agents:**
-```bash
-cmux ls
-```
-
-**Attach / detach:**
-```bash
-cmux attach alice   # attach terminal
-# Ctrl-b d          # detach (standard tmux keybinding)
-```
-
-**Stop an agent:**
-```bash
-cmux stop alice
-```
-
-### Messaging
-
-```bash
-cmux send alice "what is the status of the build?"
-```
-
-Messages are delivered as `[sender@cmux]: <message>` once Claude is idle. The sender is auto-detected when sending from inside a cmux session; pass `--from <name>` to set it explicitly:
-
-```bash
-cmux send alice "the tests are passing" --from bob
-```
-
-### Workspaces
-
-Group agents into one tmux session as windows/tabs:
-
-```bash
-cmux -s myproject start alice -d -- "You are Alice."
-cmux -s myproject start bob -d   -- "You are Bob."
-
-cmux attach alice        # opens myproject on Alice's window
-# Ctrl-b n / Ctrl-b p   # move between agent windows
-
-cmux stop bob            # kills Bob's window; workspace and Alice stay alive
-```
-
-`cmux ls` shows agents grouped by workspace:
-
-```
-AGENT                WORKSPACE        STARTED
-------------------------------------------------------------
-alice                myproject        2026-06-15T10:00:00Z
-bob                  myproject        2026-06-15T10:00:01Z
-carol                -                2026-06-15T10:00:02Z
-```
-
 ## Tutorial
 
 Let's create a `demo` team with Alice, Bob, and Carol. Bob will check if there are any new GitHub issues today for the Open Library project. Carol will check if there are any new unassigned PRs. Both will report to Alice, who gives us a summary of what's new.
@@ -147,6 +81,191 @@ Bob and Carol each run their queries, send results to Alice's inbox, and Alice c
 
 ```bash
 cmux stop alice && cmux stop bob && cmux stop carol
+```
+
+---
+
+## Usage
+
+### Agents
+
+**Start an agent** (starts and attaches):
+```bash
+cmux alice
+```
+
+**Start detached, with an initial prompt:**
+```bash
+cmux start alice -d -- "You are Alice, a project coordinator."
+```
+
+**List agents:**
+```bash
+cmux ls
+```
+
+**Attach / detach:**
+```bash
+cmux attach alice   # attach terminal
+# Ctrl-b d          # detach (standard tmux keybinding)
+```
+
+**Stop an agent:**
+```bash
+cmux stop alice
+```
+
+### Messaging
+
+```bash
+cmux send alice "what is the status of the build?"
+```
+
+Messages are delivered as `[sender@cmux]: <message>` once Claude is idle. The sender is auto-detected when sending from inside a cmux session; pass `--from <name>` to set it explicitly:
+
+```bash
+cmux send alice "the tests are passing" --from bob
+```
+
+**Message length limits:** Messages over 2000 characters are rejected outright. Messages over ~400 characters may be detected by Claude Code's TUI as a paste event and shown as `[paste N lines]` rather than delivered as text — if this matters, write long content to a file and send a short pointer message instead.
+
+### Workspaces
+
+Group agents into one tmux session as windows/tabs:
+
+```bash
+cmux -s myproject start alice -d -- "You are Alice."
+cmux -s myproject start bob -d   -- "You are Bob."
+
+cmux attach alice        # opens myproject on Alice's window
+# Ctrl-b n / Ctrl-b p   # move between agent windows
+
+cmux stop bob            # kills Bob's window; workspace and Alice stay alive
+```
+
+`cmux ls` shows agents grouped by workspace:
+
+```
+AGENT                WORKSPACE        STARTED
+------------------------------------------------------------
+alice                myproject        2026-06-15T10:00:00Z
+bob                  myproject        2026-06-15T10:00:01Z
+carol                -                2026-06-15T10:00:02Z
+```
+
+**Restart all workspace agents** (e.g. after a reboot):
+
+```bash
+cmux -s myproject
+```
+
+This starts every agent registered to `myproject` that isn't already alive — no need to re-pass prompts or flags.
+
+### Persistent agent registry
+
+Agents are ephemeral by default — `cmux start alice` launches a fresh session with no memory between runs. To make an agent persistent (surviving stop/restart/reboot), register it first:
+
+```bash
+cmux agent register alice --role "Coordinator" --workspace demo -- "Initial prompt text"
+```
+
+After registration, `cmux start alice` auto-restores the workspace and initial prompt from the registry, with no flags needed. The registry lives in `~/.cmux/agents.db` and is never cleared by `cmux stop`.
+
+This mirrors the Docker model: `cmux agent register` is like defining a container image; `cmux start` / `cmux stop` run and stop instances of it.
+
+**List all registered agents (running + stopped):**
+
+```bash
+cmux agent list
+```
+
+**Remove an agent from the registry** (does not stop a running agent):
+
+```bash
+cmux agent rm alice
+```
+
+**Bootstrap the registry from currently running sessions:**
+
+```bash
+cmux agent import-sessions
+```
+
+### Session continuity
+
+Each `cmux up` either starts a fresh session (first time) or resumes the previous one (`--continue`). The `.initialized` marker in the agent's home dir controls which.
+
+**First start** — onboarding message sent, `identity.md` scaffolded from initial prompt:
+
+```bash
+cmux up alice -d -- "You are Alice, the auth specialist."
+# Writes ~/.cmux/alice/identity.md, sends onboarding, starts fresh Claude.
+```
+
+**Subsequent starts** — session resumes via `claude --continue`, brief orientation injected:
+
+```bash
+cmux up alice -d
+# Resumes Alice's last conversation. Previous context is in session history.
+```
+
+**Agent home dir** — `~/.cmux/{name}/` persists across restarts. Agents use it for:
+- `identity.md` — role/persona context, auto-injected on first start
+- `.cq/` — personal issue queue (`cq issue list` auto-resolves here)
+- `notes/` — any persistent scratchpad files
+
+**Task tracking** — use `cq`, the per-agent issue tracker:
+
+```bash
+cq issue create -t "Review open PRs"        # creates issue in ~/.cmux/alice/.cq/
+cq issue list                               # shows open issues for current agent
+```
+
+cq is auto-resolved to the agent's home dir when `CMUX_SESSION_NAME` is set (which cmux always sets).
+
+### Health check
+
+Agents can silently block on Claude Code permission prompts for hours. `cmux check` inspects every running agent non-destructively:
+
+```bash
+cmux check
+```
+
+```
+Checking 3 running agent(s)...
+  [OK]    alice
+  [STUCK] bob             — permission prompt detected (demo:bob)
+  [OK]    carol
+
+1 agent(s) blocked at permission prompt:
+  tmux attach -t demo:bob
+```
+
+Attach to the reported target and approve or deny to unblock.
+
+### Auto-unblock mode
+
+If you trust an agent to dismiss permission prompts automatically, start it with `--unblock`:
+
+```bash
+cmux start alice -d --unblock
+# or register it persistently:
+cmux agent register alice --unblock
+```
+
+With `--unblock`, a background thread polls the agent's pane every 1–2 seconds. When a permission/security prompt is detected, it sends `Escape` to dismiss it and then injects:
+
+```
+[claudio@noreply]: A security/permission prompt was detected and automatically dismissed.
+Something in our workflow triggered a blocking security response — continuing with normal operation.
+```
+
+This lets fully autonomous agents keep running without human approval. Use with care — `--unblock` bypasses every security confirmation Claude Code would normally show you.
+
+The flag is stored in `agents.db`, so it is restored on every `cmux start` after registration. Toggle it off by re-registering without the flag:
+
+```bash
+cmux agent register alice   # clears --unblock
 ```
 
 ---
