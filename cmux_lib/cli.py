@@ -158,6 +158,68 @@ def cmd_inbox(name):
     open(inbox_path, 'w').close()
 
 
+def _snapshot_claude_sessions():
+    """Return {filepath: mtime} for all current Claude session files."""
+    projects = os.path.expanduser('~/.claude/projects')
+    snapshot = {}
+    if not os.path.isdir(projects):
+        return snapshot
+    for proj in os.listdir(projects):
+        proj_path = os.path.join(projects, proj)
+        if os.path.isdir(proj_path):
+            for f in os.listdir(proj_path):
+                if f.endswith('.jsonl'):
+                    fp = os.path.join(proj_path, f)
+                    try:
+                        snapshot[fp] = os.path.getmtime(fp)
+                    except OSError:
+                        pass
+    return snapshot
+
+
+def _store_session_id(home, pre_snapshot):
+    """Detect which Claude session file is new/updated since pre_snapshot and store its UUID."""
+    post = _snapshot_claude_sessions()
+    candidates = [
+        fp for fp, mtime in post.items()
+        if fp not in pre_snapshot or mtime > pre_snapshot[fp]
+    ]
+    if not candidates:
+        return
+    newest = max(candidates, key=lambda fp: post[fp])
+    session_uuid = os.path.splitext(os.path.basename(newest))[0]
+    try:
+        with open(os.path.join(home, 'last-session-id'), 'w') as f:
+            f.write(session_uuid)
+    except OSError:
+        pass
+
+
+def _inject_identity(home):
+    """Inject identity.md contents as a cmux message. Warns to stderr if too long."""
+    identity_path = os.path.join(home, 'identity.md')
+    if not os.path.exists(identity_path):
+        return
+    try:
+        content = open(identity_path).read().strip()
+    except Exception:
+        return
+    if not content:
+        return
+    msg = f'[cmux]: Your identity/role context from {identity_path}:\n\n{content}'
+    if len(msg) <= MAX_MESSAGE_LEN:
+        # Derive agent name from home dir basename for cmd_send
+        name = os.path.basename(home)
+        cmd_send(name, msg, sender='cmux')
+    else:
+        print(
+            f'cmux: warning — {identity_path} is too long to inject '
+            f'({len(msg)} chars, limit {MAX_MESSAGE_LEN}). '
+            f'Trim it or split role definition from procedures into a separate workflow file.',
+            file=sys.stderr,
+        )
+
+
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False, unblock=False):
     """Start a new cmux session (window). Uses DB registration if available."""
     # Fall back to DB registration for any unspecified args
@@ -202,9 +264,20 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         _shutil.copy2(_migrate_src, _migrate_dst)
 
     claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
-    # --continue resumes the most recent session; safe to pass unconditionally
-    # (Claude Code starts fresh if there is no prior session).
-    claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin} --continue'
+    # Use --resume <id> if we tracked the agent's last session, otherwise
+    # --continue (picks most recent session for this CWD — correct for solo
+    # agents, potentially wrong for shared-workspace agents before first tracked start).
+    session_id_path = os.path.join(home, 'last-session-id')
+    stored_id = None
+    if os.path.exists(session_id_path):
+        stored_id = open(session_id_path).read().strip() or None
+    if stored_id:
+        claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin} --resume {stored_id}'
+    else:
+        claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin} --continue'
+
+    # Snapshot existing Claude session files so we can detect the new one after start.
+    _pre_sessions = _snapshot_claude_sessions()
 
     sess_exists = subprocess.run(
         ['tmux', 'has-session', '-t', tmux_sess], capture_output=True
@@ -266,6 +339,9 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
 
     _wait_for_socket(reg[name]['socket'])
 
+    # Detect and store the Claude session ID so next restart uses --resume.
+    _store_session_id(home, _pre_sessions)
+
     cmux_info = (
         f'You are a cmux agent named "{name}". '
         f'Your home directory is {home} — your personal context, notes, and issue queue live there. '
@@ -280,18 +356,29 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     )
     cmd_send(name, cmux_info, sender='cmux')
 
-    # Inject identity.md if present — gives the agent their role context on every
-    # startup without relying solely on session history (which may be compacted).
-    identity_path = os.path.join(home, 'identity.md')
-    if os.path.exists(identity_path):
+    # Inject identity.md — gives the agent their role context on every startup
+    # without relying solely on session history (which may be compacted).
+    _inject_identity(home)
+
+    # Inject workflow file if registered and readable.
+    workflow_path = (reg_info.get('workflow_path') if reg_info else None)
+    if workflow_path:
+        workflow_path = os.path.expanduser(workflow_path)
         try:
-            content = open(identity_path).read().strip()
-            if content:
-                identity_msg = f'[cmux]: Your identity/role context from {identity_path}:\n\n{content}'
-                if len(identity_msg) <= MAX_MESSAGE_LEN:
-                    cmd_send(name, identity_msg, sender='cmux')
-        except Exception:
-            pass
+            wf_content = open(workflow_path).read().strip()
+            if wf_content:
+                wf_msg = f'[cmux]: Your workflow from {workflow_path}:\n\n{wf_content}'
+                if len(wf_msg) <= MAX_MESSAGE_LEN:
+                    cmd_send(name, wf_msg, sender='cmux')
+                else:
+                    print(
+                        f'cmux: warning — workflow file {workflow_path} is too long to inject '
+                        f'({len(wf_msg)} chars, limit {MAX_MESSAGE_LEN}). '
+                        f'Consider splitting it or using the file-based pattern: send a pointer, not the content.',
+                        file=sys.stderr,
+                    )
+        except OSError:
+            print(f'cmux: warning — workflow file not found: {workflow_path}', file=sys.stderr)
 
     if detach:
         print(f"cmux: agent '{name}' started  (cmux attach {name} to open)")

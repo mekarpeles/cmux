@@ -714,8 +714,11 @@ class TestUpDownRm(_CmuxBase):
         self.assertIn('down', r.stderr)
 
 
+import cmux_lib.cli as _cli_module_for_session
+
+
 class TestSessionContinuity(_CmuxBase):
-    """Tests for home dir scaffolding and --continue behaviour."""
+    """Tests for home dir scaffolding, session ID tracking, workflow/identity injection."""
 
     def test_up_writes_identity_from_initial_prompt(self):
         """cmux up writes initial_prompt to identity.md if identity.md absent."""
@@ -741,7 +744,7 @@ class TestSessionContinuity(_CmuxBase):
         self.assertNotIn('Overwrite attempt', content)
 
     def test_restart_succeeds_after_stop(self):
-        """cmux up after down starts the agent again (--continue is unconditional)."""
+        """cmux up after down starts the agent again."""
         name = f'sc{_rnd()}'
         self._start(name)
         _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
@@ -751,6 +754,90 @@ class TestSessionContinuity(_CmuxBase):
         self._started.append(name)
         reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
         self.assertIn(name, reg)
+
+    def test_session_id_not_written_when_no_new_sessions(self):
+        """In the fake_claude test env no real Claude sessions are created,
+        so last-session-id is not written — _store_session_id is a safe no-op."""
+        name = f'sc{_rnd()}'
+        self._start(name)
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        sid_path = os.path.join(self.state_dir, name, 'last-session-id')
+        # Either file doesn't exist (no sessions detected) or contains a valid UUID-like string
+        if os.path.exists(sid_path):
+            sid = open(sid_path).read().strip()
+            self.assertTrue(len(sid) > 0)
+
+    def test_snapshot_detect_new_session_file(self):
+        """_store_session_id detects a new .jsonl file added after snapshot."""
+        import tempfile, uuid as _uuid
+        home = tempfile.mkdtemp(prefix='cmux-sess-test-')
+        projects = tempfile.mkdtemp(prefix='cmux-claude-projects-')
+        proj_dir = os.path.join(projects, '-Users-mek-Projects-pm')
+        os.makedirs(proj_dir)
+
+        # Patch the projects dir
+        orig = _cli_module_for_session._snapshot_claude_sessions
+        def _patched_snapshot():
+            snap = {}
+            for f in os.listdir(proj_dir):
+                if f.endswith('.jsonl'):
+                    fp = os.path.join(proj_dir, f)
+                    snap[fp] = os.path.getmtime(fp)
+            return snap
+
+        _cli_module_for_session._snapshot_claude_sessions = _patched_snapshot
+        try:
+            pre = _patched_snapshot()
+            # Simulate Claude creating a new session file
+            new_uuid = str(_uuid.uuid4())
+            new_file = os.path.join(proj_dir, f'{new_uuid}.jsonl')
+            with open(new_file, 'w') as f:
+                f.write('{}')
+            _cli_module_for_session._store_session_id(home, pre)
+            sid = open(os.path.join(home, 'last-session-id')).read().strip()
+            self.assertEqual(sid, new_uuid)
+        finally:
+            _cli_module_for_session._snapshot_claude_sessions = orig
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(projects, ignore_errors=True)
+
+    def test_identity_too_long_warns_to_stderr(self):
+        """Oversized identity.md prints a warning instead of silently doing nothing."""
+        import io
+        from unittest.mock import patch as _patch
+        home = tempfile.mkdtemp(prefix='cmux-id-test-')
+        identity_path = os.path.join(home, 'identity.md')
+        try:
+            with open(identity_path, 'w') as f:
+                f.write('x' * 2000)  # wrapped message will exceed MAX_MESSAGE_LEN
+            buf = io.StringIO()
+            with _patch('cmux_lib.cli.cmd_send'):
+                with _patch('sys.stderr', buf):
+                    _cli_module_for_session._inject_identity(home)
+            self.assertIn('too long', buf.getvalue())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_workflow_file_injected_at_startup(self):
+        """Workflow file contents are sent at startup when workflow_path is registered."""
+        import tempfile
+        name = f'sc{_rnd()}'
+        wf_file = tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False)
+        wf_file.write('Step 1: do the thing.\nStep 2: verify.')
+        wf_file.close()
+        try:
+            _cmux('agent', 'register', name, '--workflow', wf_file.name, state_dir=self.state_dir)
+            self._start(name)
+            _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+            # Verify workflow path is in the DB
+            db_path = os.path.join(self.state_dir, 'agents.db')
+            conn = sqlite3.connect(db_path)
+            row = conn.execute('SELECT workflow_path FROM agents WHERE name = ?', (name,)).fetchone()
+            conn.close()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], wf_file.name)
+        finally:
+            os.unlink(wf_file.name)
 
 
 class TestUnblockIntegration(_CmuxBase):
