@@ -840,6 +840,46 @@ class TestSessionContinuity(_CmuxBase):
             os.unlink(wf_file.name)
 
 
+class TestWizard(unittest.TestCase):
+    """Unit tests for cmd_wizard — no tmux or claude needed."""
+
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp(prefix='cmux-wizard-test-')
+        self._orig_state = _cli_module_for_session.STATE_DIR
+        _cli_module_for_session.STATE_DIR = self.state_dir
+
+    def tearDown(self):
+        _cli_module_for_session.STATE_DIR = self._orig_state
+        shutil.rmtree(self.state_dir, ignore_errors=True)
+
+    def test_wizard_writes_claude_md_from_wizard_md(self):
+        """cmd_wizard writes wizard.md content as CLAUDE.md into .wizard dir."""
+        from unittest.mock import patch as _patch
+        with _patch('os.execvp'), _patch('os.chdir'):
+            _cli_module_for_session.cmd_wizard()
+        claude_md = os.path.join(self.state_dir, '.wizard', 'CLAUDE.md')
+        self.assertTrue(os.path.exists(claude_md))
+        content = open(claude_md).read()
+        self.assertIn('wizard', content.lower())
+
+    def test_wizard_dir_created_in_state_dir(self):
+        """~/.cmux/.wizard/ directory is created by cmd_wizard."""
+        from unittest.mock import patch as _patch
+        with _patch('os.execvp'), _patch('os.chdir'):
+            _cli_module_for_session.cmd_wizard()
+        wizard_dir = os.path.join(self.state_dir, '.wizard')
+        self.assertTrue(os.path.isdir(wizard_dir))
+
+    def test_wizard_execs_claude_with_continue(self):
+        """cmd_wizard calls os.execvp with claude --continue."""
+        from unittest.mock import patch as _patch, call as _call
+        with _patch('os.execvp') as mock_exec, _patch('os.chdir'):
+            _cli_module_for_session.cmd_wizard()
+        mock_exec.assert_called_once()
+        _, exec_args = mock_exec.call_args[0]
+        self.assertIn('--continue', exec_args)
+
+
 class TestUnblockIntegration(_CmuxBase):
 
     def test_start_with_unblock_flag_recorded_in_registry(self):

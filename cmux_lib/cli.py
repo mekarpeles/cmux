@@ -692,6 +692,41 @@ def cmd_check():
         print(f'All {len(ok)} agent(s) OK.')
 
 
+def cmd_wizard():
+    """Launch the cmux wizard — an interactive onboarding guide.
+
+    Runs claude directly in the current terminal from ~/.cmux/.wizard/, where
+    wizard.md is installed as CLAUDE.md. Claude Code loads CLAUDE.md automatically
+    as project context, so the wizard gets its full script with no flags needed.
+
+    No agent name is claimed, no DB entry is created. The session lives in
+    ~/.cmux/.wizard/ and resumes via --continue on subsequent cmux --wizard calls.
+    """
+    prompt_path = os.path.join(os.path.dirname(__file__), 'wizard.md')
+    try:
+        wizard_prompt = open(prompt_path).read().strip()
+    except OSError:
+        print(f'cmux: wizard prompt not found at {prompt_path}', file=sys.stderr)
+        sys.exit(1)
+
+    wizard_dir = os.path.join(STATE_DIR, '.wizard')
+    os.makedirs(wizard_dir, exist_ok=True)
+
+    claude_md = os.path.join(wizard_dir, 'CLAUDE.md')
+    with open(claude_md, 'w') as f:
+        f.write(wizard_prompt)
+
+    claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
+
+    print('cmux: launching wizard — your interactive cmux guide')
+    print('      (/exit or Ctrl-C when done; next cmux --wizard resumes here)\n')
+
+    # cd into wizard dir so Claude picks up CLAUDE.md, then exec claude --continue
+    # (--continue resumes the prior session if one exists; starts fresh otherwise).
+    os.chdir(wizard_dir)
+    os.execvp(claude_bin, [claude_bin, '--continue'])
+
+
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
@@ -700,6 +735,7 @@ USAGE = """\
 cmux — Claude Code multiplexer
 
 Usage:
+  cmux --wizard                             Interactive onboarding guide (start here!)
   cmux [-s workspace] <agent>               Bring agent up and attach (shorthand)
   cmux [-s workspace] up <agent> [-d] [--no-inject] [--unblock] [-- "initial prompt"]
   cmux [-s workspace] down <agent>          Take agent offline (home dir preserved)
@@ -744,6 +780,10 @@ def main():
     if not args or args[0] in ('-h', '--help'):
         print(USAGE)
         sys.exit(0)
+
+    if args[0] in ('--wizard', 'wizard'):
+        cmd_wizard()
+        return
 
     _require_tmux()
 
