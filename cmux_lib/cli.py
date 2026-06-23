@@ -7,10 +7,31 @@ import subprocess
 import sys
 import time
 
+from cmux_lib import db
+from cmux_lib.daemon import _PERM_PATTERNS
+
 STATE_DIR = os.environ.get('CMUX_STATE_DIR', os.path.expanduser('~/.cmux'))
 REGISTRY = os.path.join(STATE_DIR, 'sessions.json')
 MAX_MESSAGE_LEN = 2000
 
+# Known agent metadata for `cmux agent import-sessions`.
+# workspace=None means standalone (own tmux session), not ol-loop.
+KNOWN_AGENTS = {
+    'lupin':  {'role': 'The Looper — coordinator', 'workspace': None,      'workflow': '~/Projects/pm/workflows/the-loop.md'},
+    'odie':   {'role': 'OPDS Performance Specialist', 'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/opds-system.md'},
+    'slater': {'role': 'The Translator — i18n',     'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/i18n-translation-update.md'},
+    'pierre': {'role': 'The PR Tidier',              'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/pr-review.md'},
+    'richy':  {'role': 'The Issue & PR Enricher',   'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/issue-refinement.md'},
+    'fonzie': {'role': 'The Responder — Needs:Response', 'workspace': 'ol-loop', 'workflow': None},
+    'locke':  {'role': 'The Security Auditor',      'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/security.md'},
+    'reno':   {'role': 'The Renovate Bundler',      'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/renovate-consolidation.md'},
+    'impa':   {'role': 'The Import Pipeline Specialist', 'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/import_workflow.md'},
+    'saul':   {'role': 'Solr Specialist',            'workspace': None,      'workflow': None},
+    'ester':  {'role': 'The Auth Specialist — S3/xauthn', 'workspace': None, 'workflow': None},
+    'fran':   {'role': 'The Frontend Tester — Playwright', 'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/frontend-testing.md'},
+    'revere': {'role': 'The Code Reviewer',          'workspace': 'ol-loop', 'workflow': None},
+    'valerie':{'role': 'The Volunteer Coordinator',  'workspace': 'ol-loop', 'workflow': '~/Projects/pm/workflows/mek-executive-assistant.md'},
+}
 
 # ------------------------------------------------------------------
 # Registry helpers
@@ -18,9 +39,43 @@ MAX_MESSAGE_LEN = 2000
 
 def load_registry():
     try:
-        return json.load(open(REGISTRY))
+        with open(REGISTRY) as f:
+            return json.load(f)
     except Exception:
         return {}
+
+
+def _parse_flags(args, kv=(), bools=()):
+    """Parse --flag value pairs and boolean flags from an arg list.
+
+    The special key 'note' captures all remaining args after --note.
+    A bare '--' sets '__prompt__' to the joined remaining args.
+    Returns (positional_list, flags_dict).
+    """
+    out = {k: None for k in kv}
+    out.update({b: False for b in bools})
+    pos = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == '--':
+            out['__prompt__'] = ' '.join(args[i + 1:]) or None
+            break
+        key = tok[2:] if tok.startswith('--') else None
+        if key in bools:
+            out[key] = True; i += 1
+        elif key in out:
+            if key == 'note':
+                out['note'] = ' '.join(args[i + 1:]); break
+            if i + 1 < len(args):
+                out[key] = args[i + 1]; i += 2
+            else:
+                i += 1
+        elif not tok.startswith('-'):
+            pos.append(tok); i += 1
+        else:
+            i += 1
+    return pos, out
 
 
 def save_registry(reg):
@@ -100,12 +155,23 @@ def cmd_inbox(name):
             print(f'[{sender}@cmux]: {msg["body"]}')
         except Exception:
             print(line, end='')
-    # Clear after reading
     open(inbox_path, 'w').close()
 
 
-def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False):
-    """Start a new cmux session (window). Attaches immediately unless --detach."""
+def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False, unblock=False):
+    """Start a new cmux session (window). Uses DB registration if available."""
+    # Fall back to DB registration for any unspecified args
+    reg_info = db.get_agent(name)
+    if reg_info:
+        if workspace is None and reg_info.get('workspace'):
+            workspace = reg_info['workspace']
+        if initial_prompt is None and reg_info.get('initial_prompt'):
+            initial_prompt = reg_info['initial_prompt']
+        if not no_inject and reg_info.get('no_inject'):
+            no_inject = bool(reg_info['no_inject'])
+        if not unblock and reg_info.get('unblock'):
+            unblock = bool(reg_info['unblock'])
+
     reg = load_registry()
 
     if name in reg and session_alive(reg[name]):
@@ -117,12 +183,29 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     tmux_sess = _tmux_session(name, workspace)
     target = _tmux_target(name, workspace)
 
-    claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
-    claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin}'
-
     os.makedirs(STATE_DIR, exist_ok=True)
+    home = os.path.join(STATE_DIR, name)
+    os.makedirs(home, exist_ok=True)
 
-    # Create the tmux session if it doesn't exist, otherwise add a window
+    # Scaffold identity.md from initial_prompt if neither exists yet.
+    if initial_prompt:
+        identity_path = os.path.join(home, 'identity.md')
+        if not os.path.exists(identity_path):
+            with open(identity_path, 'w') as _f:
+                _f.write(initial_prompt)
+
+    # Drop MIGRATE.md into home dir if not already present.
+    _migrate_src = os.path.join(os.path.dirname(__file__), '..', 'MIGRATE.md')
+    _migrate_dst = os.path.join(home, 'MIGRATE.md')
+    if not os.path.exists(_migrate_dst) and os.path.exists(_migrate_src):
+        import shutil as _shutil
+        _shutil.copy2(_migrate_src, _migrate_dst)
+
+    claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
+    # --continue resumes the most recent session; safe to pass unconditionally
+    # (Claude Code starts fresh if there is no prior session).
+    claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin} --continue'
+
     sess_exists = subprocess.run(
         ['tmux', 'has-session', '-t', tmux_sess], capture_output=True
     ).returncode == 0
@@ -139,18 +222,21 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         )
 
     daemon_log = os.path.join(STATE_DIR, f'{name}.daemon.log')
-    daemon_pid_file = os.path.join(STATE_DIR, f'{name}.daemon.pid')
+    try:
+        os.unlink(os.path.join(STATE_DIR, f'{name}.daemon.pid'))
+    except FileNotFoundError:
+        pass
     daemon_args = [sys.executable, '-m', 'cmux_lib.daemon', name, target]
     if no_inject:
         daemon_args.append('--no-inject')
+    if unblock:
+        daemon_args.append('--unblock')
     daemon_proc = subprocess.Popen(
         daemon_args,
         stdout=open(daemon_log, 'w'),
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
-    with open(daemon_pid_file, 'w') as f:
-        f.write(str(daemon_proc.pid))
 
     reg[name] = {
         'name': name,
@@ -163,26 +249,49 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         'started': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'initial_prompt': initial_prompt,
         'no_inject': no_inject,
+        'unblock': unblock,
     }
     save_registry(reg)
 
-    # Wait for daemon socket to be ready, then enqueue startup messages
+    # Every cmux up upserts to DB — all agents are persistent by default.
+    db.register_agent(
+        name,
+        role=reg_info.get('role') if reg_info else None,
+        workspace=workspace,
+        workflow_path=reg_info.get('workflow_path') if reg_info else None,
+        initial_prompt=initial_prompt,
+        no_inject=no_inject,
+        unblock=unblock,
+    )
+
     _wait_for_socket(reg[name]['socket'])
+
     cmux_info = (
         f'You are a cmux agent named "{name}". '
+        f'Your home directory is {home} — your personal context, notes, and issue queue live there. '
+        f'Your issue queue: run `cq issue list` (auto-resolves to your home dir). '
+        f'Read {os.path.join(home, "MIGRATE.md")} to migrate your context into your home dir. '
         f'Wait for instructions before doing anything — do not introduce yourself, '
         f'send messages, or take any action until you receive a task. '
-        f'Messages from other agents are delivered to you automatically when you are idle — '
-        f'you do NOT need to poll, fetch, or receive them. They arrive as: [sender@cmux]: <message>. '
-        f'To message another agent, run: cmux send <agent-name> "<your message>". '
-        f'Your name ("{name}") is already known from your environment — do NOT pass --from. '
-        f'To see all running agents, run: cmux ls. '
-        f'Do NOT use `cmux start` unless instructed — you are not responsible for starting other agents.'
+        f'Messages from other agents arrive automatically as: [sender@cmux]: <message>. '
+        f'To message another agent: cmux send <agent-name> "<message>". '
+        f'Your name ("{name}") is set in your environment — do NOT pass --from. '
+        f'To see all running agents: cmux ls.'
     )
-    if initial_prompt:
-        cmd_send(name, f'{cmux_info}\n\n{initial_prompt}', sender='cmux')
-    else:
-        cmd_send(name, cmux_info, sender='cmux')
+    cmd_send(name, cmux_info, sender='cmux')
+
+    # Inject identity.md if present — gives the agent their role context on every
+    # startup without relying solely on session history (which may be compacted).
+    identity_path = os.path.join(home, 'identity.md')
+    if os.path.exists(identity_path):
+        try:
+            content = open(identity_path).read().strip()
+            if content:
+                identity_msg = f'[cmux]: Your identity/role context from {identity_path}:\n\n{content}'
+                if len(identity_msg) <= MAX_MESSAGE_LEN:
+                    cmd_send(name, identity_msg, sender='cmux')
+        except Exception:
+            pass
 
     if detach:
         print(f"cmux: agent '{name}' started  (cmux attach {name} to open)")
@@ -190,12 +299,43 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         cmd_attach(name)
 
 
-def cmd_ls():
-    """List all agents, pruning dead ones."""
-    reg = load_registry()
-    if not reg:
-        print('No agents running.')
+def cmd_start_workspace(workspace):
+    """Start all agents registered to a workspace that aren't already running."""
+    agents = db.agents_in_workspace(workspace)
+    if not agents:
+        print(f"cmux: no agents registered for workspace '{workspace}'")
+        print(f"      Register agents with: cmux agent register <name> --workspace {workspace}")
         return
+
+    reg = load_registry()
+    started = []
+    already_running = []
+
+    for agent_info in agents:
+        name = agent_info['name']
+        if name in reg and session_alive(reg[name]):
+            already_running.append(name)
+        else:
+            print(f"cmux: starting '{name}' in workspace '{workspace}'...")
+            cmd_start(
+                name,
+                initial_prompt=agent_info.get('initial_prompt'),
+                detach=True,
+                workspace=workspace,
+                no_inject=bool(agent_info.get('no_inject', 0)),
+                unblock=bool(agent_info.get('unblock', 0)),
+            )
+            started.append(name)
+
+    if started:
+        print(f"cmux: started {len(started)} agent(s): {', '.join(started)}")
+    if already_running:
+        print(f"cmux: already running: {', '.join(already_running)}")
+
+
+def cmd_ls():
+    """List all agents: running first, then registered-but-stopped."""
+    reg = load_registry()
 
     dead = [n for n, info in reg.items() if not session_alive(info)]
     for n in dead:
@@ -203,15 +343,39 @@ def cmd_ls():
         del reg[n]
     if dead:
         save_registry(reg)
-    if not reg:
-        print('No agents running.')
-        return
 
-    print(f'{"AGENT":<20} {"WORKSPACE":<16} STARTED')
-    print('-' * 60)
+    all_registered = db.list_agents()
+    db_entries = {a['name']: a for a in all_registered}
+    running_names = set(reg.keys())
+
+    header = f'{"AGENT":<18} {"STATUS":<10} {"WORKSPACE":<14} ROLE'
+    divider = '-' * 72
+
+    rows = []
+    # Running — sorted by workspace then name
     for name, info in sorted(reg.items(), key=lambda x: (x[1].get('workspace') or '', x[0])):
         ws = info.get('workspace') or '-'
-        print(f'{name:<20} {ws:<16} {info.get("started", "")}')
+        role = (db_entries.get(name, {}).get('role') or '')[:28]
+        rows.append(f'{name:<18} {"up":<10} {ws:<14} {role}')
+
+    # Stopped/registered
+    for a in all_registered:
+        if a['name'] not in running_names:
+            ws = a.get('workspace') or '-'
+            role = (a.get('role') or '')[:28]
+            rows.append(f'{a["name"]:<18} {"down":<10} {ws:<14} {role}')
+
+    if not rows:
+        print('No agents registered. Run: cmux up <name>')
+        return
+
+    print(header)
+    print(divider)
+    for row in rows:
+        print(row)
+
+    if any(a['name'] not in running_names for a in all_registered):
+        print(f'\n  cmux up <name>   or   cmux -s <workspace>   to bring agents up')
 
 
 def cmd_send(name, message, sender=None):
@@ -259,7 +423,6 @@ def cmd_attach(name):
     info = reg[name]
     tmux_sess = info.get('tmux_session', f'cmux-{name}')
     window = info.get('tmux_window', name)
-    # Attach to the session and select the right window
     os.execvp('tmux', ['tmux', 'attach', '-t', f'{tmux_sess}:{window}'])
 
 
@@ -270,7 +433,9 @@ def cmd_detach(name):
         print(f"cmux: no session '{name}'", file=sys.stderr)
         sys.exit(1)
     tmux_sess = reg[name].get('tmux_session', f'cmux-{name}')
-    subprocess.run(['tmux', 'detach-client', '-s', tmux_sess], check=True)
+    # Ignore non-zero exit — detach-client returns an error if no client is attached,
+    # which is a no-op (session still alive), not a failure.
+    subprocess.run(['tmux', 'detach-client', '-s', tmux_sess], capture_output=True)
     print(f"cmux: detached from agent '{name}'")
 
 
@@ -286,7 +451,6 @@ def cmd_stop(name):
     workspace = info.get('workspace')
 
     if workspace:
-        # Kill just this window, leave the rest of the workspace alive
         subprocess.run(
             ['tmux', 'kill-window', '-t', f'{tmux_sess}:{name}'],
             capture_output=True
@@ -305,6 +469,140 @@ def cmd_stop(name):
     del reg[name]
     save_registry(reg)
     print(f"cmux: agent '{name}' stopped")
+    # Agent remains in agents.db — restart with `cmux start {name}`
+
+
+# ------------------------------------------------------------------
+# Agent registry commands
+# ------------------------------------------------------------------
+
+def cmd_agent_register(name, role=None, workspace=None, workflow_path=None,
+                       initial_prompt=None, no_inject=False, unblock=False):
+    """Register an agent in the persistent catalog."""
+    db.register_agent(name, role=role, workspace=workspace, workflow_path=workflow_path,
+                      initial_prompt=initial_prompt, no_inject=no_inject, unblock=unblock)
+    print(f"cmux: registered '{name}'")
+    if workspace:
+        print(f"         workspace: {workspace}")
+    if role:
+        print(f"         role:      {role}")
+    if workflow_path:
+        print(f"         workflow:  {workflow_path}")
+
+
+def cmd_agent_list():
+    """Alias for cmux ls — shows all agents (running + stopped)."""
+    cmd_ls()
+
+
+def cmd_agent_rm(name):
+    """Remove agent from catalog (does not stop a running agent)."""
+    existing = db.get_agent(name)
+    if not existing:
+        print(f"cmux: '{name}' is not registered")
+        return
+    db.remove_agent(name)
+    print(f"cmux: removed '{name}' from registry")
+
+    reg = load_registry()
+    if name in reg and session_alive(reg[name]):
+        print(f"         note: '{name}' is still running — stop with: cmux stop {name}")
+
+
+def cmd_rm(name):
+    """De-register an agent: removes from agents.db only. Agent must be down first.
+
+    The home directory (~/.cmux/{name}/) is intentionally preserved — it contains
+    cq history, scripts, and logs that have provenance value. Remove it manually
+    if you need to reclaim the space.
+    """
+    reg = load_registry()
+    if name in reg and session_alive(reg[name]):
+        print(f"cmux: '{name}' is still running — bring it down first: cmux down {name}",
+              file=sys.stderr)
+        sys.exit(1)
+    db.remove_agent(name)
+    home = os.path.join(STATE_DIR, name)
+    print(f"cmux: '{name}' de-registered")
+    if os.path.isdir(home):
+        print(f"         home dir preserved: {home}")
+
+
+def cmd_agent_import_sessions():
+    """Bootstrap DB from sessions.json + KNOWN_AGENTS metadata."""
+    sessions = load_registry()
+    count = 0
+
+    for name, info in sessions.items():
+        known = KNOWN_AGENTS.get(name, {})
+        db.register_agent(
+            name,
+            role=known.get('role'),
+            workspace=info.get('workspace') or known.get('workspace'),
+            workflow_path=known.get('workflow'),
+            initial_prompt=info.get('initial_prompt'),
+            no_inject=info.get('no_inject', False),
+            unblock=info.get('unblock', False),
+        )
+        print(f"  registered: {name} (from sessions.json)")
+        count += 1
+
+    # Register agents in KNOWN_AGENTS that aren't in sessions.json
+    for name, known in KNOWN_AGENTS.items():
+        if name not in sessions:
+            db.register_agent(
+                name,
+                role=known.get('role'),
+                workspace=known.get('workspace'),
+                workflow_path=known.get('workflow'),
+            )
+            print(f"  registered: {name} (from KNOWN_AGENTS, not currently running)")
+            count += 1
+
+    print(f"\ncmux: registered {count} agent(s) into {db.DB_PATH}")
+    print("      Running agents are unaffected.")
+
+
+# ------------------------------------------------------------------
+# Session health check
+# ------------------------------------------------------------------
+
+def cmd_check():
+    """Check all running agents for permission-prompt blockage."""
+    reg = load_registry()
+    alive = {n: info for n, info in reg.items() if session_alive(info)}
+
+    if not alive:
+        print('No agents running.')
+        return
+
+    print(f'Checking {len(alive)} running agent(s)...')
+    stuck = []
+    ok = []
+
+    for name, info in sorted(alive.items()):
+        target = info.get('tmux_target', _tmux_target(name, info.get('workspace')))
+        r = subprocess.run(
+            ['tmux', 'capture-pane', '-t', target, '-p', '-S', '-15'],
+            capture_output=True, text=True
+        )
+        pane_text = r.stdout.lower() if r.returncode == 0 else ''
+
+        is_stuck = any(pat in pane_text for pat in _PERM_PATTERNS)
+        if is_stuck:
+            stuck.append((name, target))
+            print(f'  [STUCK] {name:<16} — permission prompt detected ({target})')
+        else:
+            ok.append(name)
+            print(f'  [OK]    {name}')
+
+    print()
+    if stuck:
+        print(f'{len(stuck)} agent(s) blocked at permission prompt:')
+        for name, target in stuck:
+            print(f'  tmux attach -t {target}')
+    else:
+        print(f'All {len(ok)} agent(s) OK.')
 
 
 # ------------------------------------------------------------------
@@ -315,29 +613,36 @@ USAGE = """\
 cmux — Claude Code multiplexer
 
 Usage:
-  cmux [-s workspace] <agent>               Start agent and attach (shorthand)
-  cmux [-s workspace] start <agent> [-d] [--no-inject] [-- "initial prompt"]
-  cmux ls                                   List agents
+  cmux [-s workspace] <agent>               Bring agent up and attach (shorthand)
+  cmux [-s workspace] up <agent> [-d] [--no-inject] [--unblock] [-- "initial prompt"]
+  cmux [-s workspace] down <agent>          Take agent offline (home dir preserved)
+  cmux rm <agent>                           De-register agent from DB; home dir preserved (must be down first)
+  cmux [-s workspace]                       Bring up ALL registered agents in workspace
+  cmux ls                                   List agents (running + registered-but-stopped)
   cmux send <agent> <message>               Enqueue a message (max 2000 chars)
   cmux attach <agent>                       Attach terminal to agent
   cmux detach <agent>                       Detach (agent keeps running)
-  cmux stop <agent>                         Stop agent
   cmux inbox <agent>                        Print and clear queued messages (--no-inject agents)
+  cmux check                                Check all agents for permission-prompt blockage
 
-Flags:
-  --no-inject   Messages are written to a file instead of injected via tmux send-keys.
-                Use for coordinator sessions (e.g. lupus) where a human is actively typing
-                in the pane. Read messages with: cmux inbox <agent>
+  start / stop still work as aliases for up / down.
+  First start launches fresh; subsequent starts resume via --continue.
+
+Agent registry (persistent catalog):
+  cmux agent register <name> [--role <r>] [--workspace <ws>] [--workflow <path>] [--no-inject] [--unblock] [-- "prompt"]
+  cmux agent list                           Show all registered agents (running + stopped)
+  cmux agent import-sessions                Bootstrap registry from current sessions.json
 
 Workspaces group agents into one tmux session as windows/tabs:
-  cmux -s myproject start alice -d
-  cmux -s myproject start bob -d
-  cmux attach alice                         Opens myproject on alice's window
+  cmux -s ol-loop up fran -d               Add fran to ol-loop workspace
+  cmux -s ol-loop                          Bring up ALL ol-loop agents (post-reboot restore)
+
+Task tracking: use cq (per-agent issue tracker). Run: cq issue list
 
 Keyboard shortcuts (when attached):
-  Ctrl-b d                                  Detach
-  Ctrl-b n / Ctrl-b p                       Next / previous agent window
-  Ctrl-b [                                  Scroll mode (q to exit)
+  Ctrl-b d                                 Detach
+  Ctrl-b n / Ctrl-b p                      Next / previous agent window
+  Ctrl-b [                                 Scroll mode (q to exit)
 """
 
 
@@ -361,12 +666,73 @@ def main():
         workspace = args[1]
         args = args[2:]
         if not args:
-            print('cmux: -s requires a subcommand or name after the workspace', file=sys.stderr)
-            sys.exit(1)
+            # `cmux -s ol-loop` with no further args → start whole workspace
+            cmd_start_workspace(workspace)
+            return
 
     cmd = args[0]
 
-    # Shorthand: `cmux [-s ws] lupus` → start + attach
+    # ------------------------------------------------------------------
+    # Agent registry subcommands
+    # ------------------------------------------------------------------
+    if cmd == 'agent':
+        sub = args[1] if len(args) > 1 else ''
+        if sub == 'list':
+            cmd_agent_list()
+        elif sub == 'rm':
+            if len(args) < 3:
+                print('cmux: agent rm requires a name', file=sys.stderr)
+                sys.exit(1)
+            cmd_agent_rm(args[2])
+        elif sub == 'import-sessions':
+            cmd_agent_import_sessions()
+        elif sub == 'register':
+            # cmux agent register <name> [--role r] [--workspace ws] [--workflow p] [--no-inject] [-- "prompt"]
+            remaining = args[2:]
+            if not remaining or remaining[0].startswith('-'):
+                print('cmux: agent register requires a name', file=sys.stderr)
+                sys.exit(1)
+            name = remaining[0]
+            _, flags = _parse_flags(remaining[1:], kv=('role', 'workspace', 'workflow'),
+                                    bools=('no-inject', 'unblock'))
+            workspace_val = flags['workspace'] or workspace  # -s flag fallback
+            cmd_agent_register(name, role=flags['role'], workspace=workspace_val,
+                               workflow_path=flags['workflow'],
+                               initial_prompt=flags.get('__prompt__'),
+                               no_inject=flags['no-inject'],
+                               unblock=flags['unblock'])
+        else:
+            print(f'cmux: unknown agent subcommand {sub!r}', file=sys.stderr)
+            print('  subcommands: register, list, rm, import-sessions')
+            sys.exit(1)
+        return
+
+    # ------------------------------------------------------------------
+    # Health check
+    # ------------------------------------------------------------------
+    if cmd == 'check':
+        cmd_check()
+        return
+
+    # ------------------------------------------------------------------
+    # Existing commands
+    # ------------------------------------------------------------------
+
+    # `rm` is top-level, not under `agent`
+    if cmd == 'rm':
+        if len(args) < 2:
+            print('cmux: rm requires an agent name', file=sys.stderr)
+            sys.exit(1)
+        cmd_rm(args[1])
+        return
+
+    # Normalise aliases: up=start, down=stop
+    if cmd == 'up':
+        cmd = 'start'
+    elif cmd == 'down':
+        cmd = 'stop'
+
+    # Shorthand: `cmux [-s ws] <name>` → up + attach
     if cmd not in ('start', 'ls', 'send', 'attach', 'detach', 'stop', 'inbox'):
         if cmd.startswith('-'):
             print(f'cmux: unknown option {cmd!r}', file=sys.stderr)
@@ -377,18 +743,20 @@ def main():
 
     if cmd == 'start':
         if len(args) < 2:
-            print('cmux: start requires a session name', file=sys.stderr)
+            print('cmux: up requires an agent name', file=sys.stderr)
             sys.exit(1)
         detach = '-d' in args or '--detach' in args
         no_inject = '--no-inject' in args
-        remaining = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject')]
+        unblock = '--unblock' in args
+        remaining = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject', '--unblock')]
         name = remaining[0]
         try:
             sep = remaining.index('--')
             initial_prompt = ' '.join(remaining[sep + 1:]) or None
         except ValueError:
             initial_prompt = None
-        cmd_start(name, initial_prompt=initial_prompt, detach=detach, workspace=workspace, no_inject=no_inject)
+        cmd_start(name, initial_prompt=initial_prompt, detach=detach, workspace=workspace,
+                  no_inject=no_inject, unblock=unblock)
 
     elif cmd == 'ls':
         cmd_ls()
@@ -425,7 +793,7 @@ def main():
 
     elif cmd == 'stop':
         if len(args) < 2:
-            print('cmux: stop requires a session name', file=sys.stderr)
+            print('cmux: down requires an agent name', file=sys.stderr)
             sys.exit(1)
         cmd_stop(args[1])
 
