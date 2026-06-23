@@ -5,14 +5,18 @@ Uses a fake Claude process and isolated state dirs so real sessions
 and ~/.cmux are never touched. Requires tmux to be installed.
 """
 
+import io
 import json
 import os
+import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import MagicMock, patch
 
 FAKE_CLAUDE = os.path.join(os.path.dirname(__file__), 'fake_claude.py')
 CMUX = 'cmux'
@@ -42,17 +46,21 @@ def _wait_socket(path, timeout=10):
     return False
 
 
-class TestCmuxIntegration(unittest.TestCase):
+def _rnd(n=4):
+    """Return a short random hex string for unique agent names."""
+    return os.urandom(n).hex()
+
+
+class _CmuxBase(unittest.TestCase):
+    """Base class with setUp/tearDown/helpers. Contains no test methods."""
 
     def setUp(self):
         self.state_dir = tempfile.mkdtemp(prefix='cmux-test-')
         self._started = []
 
     def tearDown(self):
-        # Stop any agents started during the test
         for name in self._started:
             _cmux('stop', name, state_dir=self.state_dir, check=False)
-        # Kill lingering tmux sessions
         subprocess.run(
             ['tmux', 'kill-session', '-t', f'cmux-test-{os.getpid()}'],
             capture_output=True,
@@ -66,6 +74,9 @@ class TestCmuxIntegration(unittest.TestCase):
         r = _cmux(*args, state_dir=self.state_dir)
         self._started.append(name)
         return r
+
+
+class TestCmuxIntegration(_CmuxBase):
 
     # ------------------------------------------------------------------
 
@@ -149,6 +160,619 @@ class TestCmuxIntegration(unittest.TestCase):
         # wb's window should still exist
         reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
         self.assertIn('wb', reg)
+
+
+    def test_stop_keeps_agent_in_db(self):
+        """stop removes from sessions.json but leaves the agent in agents.db."""
+        # Register so cmd_start upserts to DB
+        _cmux('agent', 'register', 'tdb', '--role', 'TestRole', state_dir=self.state_dir)
+        self._start('tdb')
+        sock = os.path.join(self.state_dir, 'tdb.sock')
+        _wait_socket(sock)
+
+        _cmux('stop', 'tdb', state_dir=self.state_dir)
+        self._started.remove('tdb')
+
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertNotIn('tdb', reg)
+
+        # Verify via raw SQLite — no need to patch db module globals
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        self.assertTrue(os.path.exists(db_path), 'agents.db should exist after stop')
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT name, role FROM agents WHERE name = ?', ('tdb',)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row, 'agent should still be in agents.db after stop')
+        self.assertEqual(row[0], 'tdb')
+        self.assertEqual(row[1], 'TestRole')
+
+
+# ------------------------------------------------------------------
+# Unit tests for db.py
+# ------------------------------------------------------------------
+
+import cmux_lib.db as _db_module
+
+
+class TestDb(unittest.TestCase):
+    """Unit tests for db.py using an isolated temp DB."""
+
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp(prefix='cmux-db-test-')
+        self._orig_state = _db_module.STATE_DIR
+        self._orig_path = _db_module.DB_PATH
+        _db_module.STATE_DIR = self.state_dir
+        _db_module.DB_PATH = os.path.join(self.state_dir, 'agents.db')
+
+    def tearDown(self):
+        _db_module.STATE_DIR = self._orig_state
+        _db_module.DB_PATH = self._orig_path
+        shutil.rmtree(self.state_dir, ignore_errors=True)
+
+    def test_register_and_get_agent(self):
+        _db_module.register_agent('alice', role='Coordinator', workspace='demo')
+        agent = _db_module.get_agent('alice')
+        self.assertIsNotNone(agent)
+        self.assertEqual(agent['name'], 'alice')
+        self.assertEqual(agent['role'], 'Coordinator')
+        self.assertEqual(agent['workspace'], 'demo')
+
+    def test_get_agent_returns_none_for_unknown(self):
+        result = _db_module.get_agent('nobody')
+        self.assertIsNone(result)
+
+    def test_register_upserts_on_name(self):
+        _db_module.register_agent('alice', role='Original')
+        _db_module.register_agent('alice', role='Updated')
+        agents = _db_module.list_agents()
+        self.assertEqual(len([a for a in agents if a['name'] == 'alice']), 1)
+        self.assertEqual(_db_module.get_agent('alice')['role'], 'Updated')
+
+    def test_list_agents_empty(self):
+        self.assertEqual(_db_module.list_agents(), [])
+
+    def test_list_agents_multiple(self):
+        _db_module.register_agent('bob', workspace='ws1')
+        _db_module.register_agent('alice', workspace='ws1')
+        _db_module.register_agent('carol')
+        names = [a['name'] for a in _db_module.list_agents()]
+        self.assertIn('alice', names)
+        self.assertIn('bob', names)
+        self.assertIn('carol', names)
+
+
+
+# ------------------------------------------------------------------
+# Unit tests for cmd_check (mocked tmux)
+# ------------------------------------------------------------------
+
+import cmux_lib.cli as _cli_module
+
+
+class TestCmdCheck(unittest.TestCase):
+    """Test cmd_check with mocked subprocess so no tmux needed."""
+
+    def _fake_reg(self, state_dir, names):
+        reg = {}
+        for name in names:
+            reg[name] = {
+                'name': name,
+                'workspace': None,
+                'tmux_session': f'cmux-{name}',
+                'tmux_window': name,
+                'tmux_target': f'cmux-{name}:{name}',
+                'socket': os.path.join(state_dir, f'{name}.sock'),
+            }
+        return reg
+
+    def _run_check(self, pane_text, names=('alice',)):
+        state_dir = tempfile.mkdtemp(prefix='cmux-check-test-')
+        try:
+            reg = self._fake_reg(state_dir, names)
+
+            def mock_run(cmd, **kwargs):
+                result = MagicMock()
+                result.returncode = 0
+                if 'list-windows' in cmd:
+                    result.stdout = '\n'.join(names) + '\n'
+                elif 'capture-pane' in cmd:
+                    result.stdout = pane_text
+                else:
+                    result.stdout = ''
+                return result
+
+            with patch.object(_cli_module, 'load_registry', return_value=reg), \
+                 patch.object(_cli_module, 'session_alive', return_value=True), \
+                 patch('cmux_lib.cli.subprocess.run', side_effect=mock_run), \
+                 patch('sys.stdout', new_callable=io.StringIO) as mock_out:
+                _cli_module.cmd_check()
+                return mock_out.getvalue()
+        finally:
+            shutil.rmtree(state_dir, ignore_errors=True)
+
+    def test_ok_agent_reported_ok(self):
+        output = self._run_check('Normal pane output, nothing suspicious here.')
+        self.assertIn('[OK]', output)
+        self.assertNotIn('[STUCK]', output)
+
+    def test_stuck_agent_detected_yes_proceed(self):
+        output = self._run_check('Do you want to allow this?\nYes, proceed\nAlways allow')
+        self.assertIn('[STUCK]', output)
+
+    def test_stuck_agent_detected_always_allow(self):
+        output = self._run_check('Always allow in future sessions')
+        self.assertIn('[STUCK]', output)
+
+    def test_stuck_agent_shows_tmux_target(self):
+        output = self._run_check('Yes, proceed')
+        self.assertIn('cmux-alice:alice', output)
+
+    def test_no_agents_running(self):
+        with patch.object(_cli_module, 'load_registry', return_value={}), \
+             patch('sys.stdout', new_callable=io.StringIO) as mock_out:
+            _cli_module.cmd_check()
+            output = mock_out.getvalue()
+        self.assertIn('No agents running', output)
+
+
+# ------------------------------------------------------------------
+# Unit tests for sanitize() in daemon.py
+# ------------------------------------------------------------------
+
+from cmux_lib.daemon import sanitize
+
+
+class TestSanitize(unittest.TestCase):
+
+    def test_newline_becomes_space(self):
+        self.assertEqual(sanitize('hello\nworld'), 'hello world')
+
+    def test_tab_becomes_space(self):
+        self.assertEqual(sanitize('hello\tworld'), 'hello world')
+
+    def test_carriage_return_becomes_space(self):
+        self.assertEqual(sanitize('hello\rworld'), 'hello world')
+
+    def test_multiple_whitespace_collapsed(self):
+        self.assertEqual(sanitize('a   \n\t  b'), 'a b')
+
+    def test_control_chars_stripped(self):
+        # 0x01 (SOH), 0x07 (BEL), 0x7f (DEL)
+        self.assertEqual(sanitize('a\x01b\x07c\x7fd'), 'abcd')
+
+    def test_leading_trailing_whitespace_stripped(self):
+        self.assertEqual(sanitize('  hello  '), 'hello')
+
+    def test_empty_string_safe(self):
+        self.assertEqual(sanitize(''), '')
+
+    def test_plain_text_unchanged(self):
+        self.assertEqual(sanitize('hello world'), 'hello world')
+
+    def test_multiline_message_arrives_flat(self):
+        # The key behavior callers must know: newlines are NOT preserved
+        result = sanitize('line one\nline two\nline three')
+        self.assertEqual(result, 'line one line two line three')
+        self.assertNotIn('\n', result)
+
+
+# ------------------------------------------------------------------
+# Integration tests for --no-inject / inbox path
+# ------------------------------------------------------------------
+
+class TestNoInject(_CmuxBase):
+    """Test file-based message delivery (--no-inject mode). No tmux pane injection."""
+
+    def test_no_inject_writes_to_inbox_file(self):
+        """Messages sent to a --no-inject agent land in inbox.jsonl, not pane."""
+        name = f'ni{_rnd()}'
+        self._start(name, '--no-inject')
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+
+        payload = f'hello-{_rnd()}'
+        _cmux('send', name, payload, state_dir=self.state_dir)
+        time.sleep(2.0)  # daemon appends on next poll (~200ms), allow headroom
+
+        inbox = os.path.join(self.state_dir, f'{name}.inbox.jsonl')
+        self.assertTrue(os.path.exists(inbox), 'inbox.jsonl should exist')
+        lines = open(inbox).readlines()
+        self.assertTrue(any(payload in line for line in lines))
+
+    def test_inbox_cmd_prints_and_clears(self):
+        """cmux inbox prints queued messages and clears the file."""
+        name = f'ni{_rnd()}'
+        self._start(name, '--no-inject')
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+
+        _cmux('send', name, 'msg-one', state_dir=self.state_dir)
+        _cmux('send', name, 'msg-two', state_dir=self.state_dir)
+
+        # Poll until both messages appear in the inbox (claudio delivers one
+        # message per idle-check cycle; allow up to 10 seconds for all cycles).
+        inbox = os.path.join(self.state_dir, f'{name}.inbox.jsonl')
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                content = open(inbox).read()
+                if 'msg-one' in content and 'msg-two' in content:
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.2)
+
+        r = _cmux('inbox', name, state_dir=self.state_dir)
+        self.assertIn('msg-one', r.stdout)
+        self.assertIn('msg-two', r.stdout)
+
+        self.assertEqual(open(inbox).read(), '')
+
+    def test_no_inject_message_not_in_pane(self):
+        """--no-inject delivery does not inject into the tmux pane."""
+        name = f'ni{_rnd()}'
+        payload = f'pane-absence-{_rnd()}'
+        self._start(name, '--no-inject')
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+
+        _cmux('send', name, payload, state_dir=self.state_dir)
+        time.sleep(1.5)
+
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        target = reg[name]['tmux_target']
+        pane = subprocess.run(
+            ['tmux', 'capture-pane', '-t', target, '-p'],
+            capture_output=True, text=True,
+        ).stdout
+        self.assertNotIn(payload, pane)
+
+
+# ------------------------------------------------------------------
+# Integration test for cmux detach
+# ------------------------------------------------------------------
+
+class TestDetach(_CmuxBase):
+
+    def test_detach_exits_zero_no_client(self):
+        """cmux detach exits 0 even when no client is attached (no-op)."""
+        name = f'det{_rnd()}'
+        self._start(name)
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        r = _cmux('detach', name, state_dir=self.state_dir)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('detached', r.stdout)
+
+    def test_detach_unknown_agent_exits_nonzero(self):
+        r = _cmux('detach', 'nobody', state_dir=self.state_dir, check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_detach_leaves_session_alive(self):
+        """After detach, the agent is still in sessions.json."""
+        name = f'det{_rnd()}'
+        self._start(name)
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _cmux('detach', name, state_dir=self.state_dir)
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertIn(name, reg)
+
+
+# ------------------------------------------------------------------
+# Integration test for workspace restart (cmux -s workspace)
+# ------------------------------------------------------------------
+
+class TestWorkspaceRestart(_CmuxBase):
+
+    def test_workspace_restart_starts_stopped_agents(self):
+        """cmux -s ws with no subcommand restarts registered stopped agents."""
+        ws = f'rws{_rnd()}'
+        a1, a2 = f'wr{_rnd()}', f'wr{_rnd()}'
+        _cmux('agent', 'register', a1, '--workspace', ws, state_dir=self.state_dir)
+        _cmux('agent', 'register', a2, '--workspace', ws, state_dir=self.state_dir)
+
+        self._start(a1, workspace=ws)
+        self._start(a2, workspace=ws)
+        _wait_socket(os.path.join(self.state_dir, f'{a1}.sock'))
+        _wait_socket(os.path.join(self.state_dir, f'{a2}.sock'))
+
+        _cmux('stop', a1, state_dir=self.state_dir)
+        _cmux('stop', a2, state_dir=self.state_dir)
+        self._started.remove(a1)
+        self._started.remove(a2)
+
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertNotIn(a1, reg)
+        self.assertNotIn(a2, reg)
+
+        env = os.environ.copy()
+        env['CMUX_STATE_DIR'] = self.state_dir
+        env['CMUX_CLAUDE_CMD'] = f'{sys.executable} {FAKE_CLAUDE}'
+        subprocess.run([CMUX, '-s', ws], env=env, capture_output=True, check=True)
+        self._started += [a1, a2]
+
+        _wait_socket(os.path.join(self.state_dir, f'{a1}.sock'))
+        _wait_socket(os.path.join(self.state_dir, f'{a2}.sock'))
+
+        reg2 = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertIn(a1, reg2)
+        self.assertIn(a2, reg2)
+
+
+# ------------------------------------------------------------------
+# Integration test for cmux agent import-sessions
+# ------------------------------------------------------------------
+
+class TestImportSessions(_CmuxBase):
+
+    def test_import_sessions_registers_from_sessions_json(self):
+        """import-sessions reads sessions.json and populates agents.db."""
+        # Write a fake sessions.json with a known agent
+        fake_reg = {
+            'odie': {
+                'name': 'odie',
+                'workspace': 'ol-loop',
+                'tmux_session': 'ol-loop',
+                'tmux_window': 'odie',
+                'tmux_target': 'ol-loop:odie',
+                'socket': os.path.join(self.state_dir, 'odie.sock'),
+                'daemon_pid': 99999,
+                'started': '2026-01-01T00:00:00Z',
+                'initial_prompt': None,
+                'no_inject': False,
+            }
+        }
+        reg_path = os.path.join(self.state_dir, 'sessions.json')
+        with open(reg_path, 'w') as f:
+            json.dump(fake_reg, f)
+
+        _cmux('agent', 'import-sessions', state_dir=self.state_dir)
+
+        # Check agents.db via raw SQLite
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        self.assertTrue(os.path.exists(db_path))
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT name, workspace, role FROM agents WHERE name = ?',
+                           ('odie',)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 'odie')
+        self.assertEqual(row[1], 'ol-loop')
+        # KNOWN_AGENTS has role for odie — import-sessions merges it
+        self.assertIsNotNone(row[2])
+
+    def test_import_sessions_registers_known_agents_not_in_sessions(self):
+        """import-sessions also registers KNOWN_AGENTS entries absent from sessions.json."""
+        # Empty sessions.json
+        reg_path = os.path.join(self.state_dir, 'sessions.json')
+        with open(reg_path, 'w') as f:
+            json.dump({}, f)
+
+        _cmux('agent', 'import-sessions', state_dir=self.state_dir)
+
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        conn = sqlite3.connect(db_path)
+        names = [r[0] for r in conn.execute('SELECT name FROM agents').fetchall()]
+        conn.close()
+        # All KNOWN_AGENTS should be registered
+        self.assertIn('lupin', names)
+        self.assertIn('fran', names)
+        self.assertIn('pierre', names)
+
+
+# ------------------------------------------------------------------
+# Unit tests for _unblock_watcher in daemon.py
+# ------------------------------------------------------------------
+
+class TestUnblockWatcher(unittest.TestCase):
+    """Unit tests for the _unblock_watcher background thread function."""
+
+    def test_watcher_sends_escape_on_permission_pattern(self):
+        """When pane contains a permission pattern, Escape is sent."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        escape_sent = threading.Event()
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_list = list(cmd)
+            if 'capture-pane' in cmd_list:
+                result.stdout = 'Yes, proceed\nDo you want to allow this?'
+            elif 'send-keys' in cmd_list and 'Escape' in cmd_list:
+                escape_sent.set()
+            return result
+
+        target = 'cmux-test:test'
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05), daemon=True)
+            t.start()
+            self.assertTrue(escape_sent.wait(timeout=5.0), 'Escape key should have been sent')
+
+    def test_watcher_injects_notification_after_escape(self):
+        """After sending Escape, the internal notification message is injected."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        notification_sent = threading.Event()
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_list = list(cmd)
+            if 'capture-pane' in cmd_list:
+                result.stdout = 'needs permission'
+            elif 'send-keys' in cmd_list and any('[claudio@noreply]' in a for a in cmd_list):
+                notification_sent.set()
+            return result
+
+        target = 'cmux-notify:test'
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run), \
+             patch('time.sleep', return_value=None):
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01), daemon=True)
+            t.start()
+            self.assertTrue(notification_sent.wait(timeout=5.0), 'notification should have been injected')
+
+    def test_watcher_no_action_on_clean_pane(self):
+        """No send-keys calls when pane has no permission patterns."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        send_key_calls = []
+        target = f'cmux-clean-{_rnd()}:test'
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_list = list(cmd)
+            result.stdout = 'Normal Claude output, nothing to see here.'
+            # Only count send-keys aimed at our target — filters out lingering threads
+            # from other tests that share the same module-level subprocess.run patch.
+            if 'send-keys' in cmd_list and target in cmd_list:
+                send_key_calls.append(cmd_list)
+            return result
+
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05), daemon=True)
+            t.start()
+            time.sleep(0.3)  # allow ~6 poll iterations
+
+        self.assertEqual(len(send_key_calls), 0, 'no send-keys calls on a clean pane')
+
+
+# ------------------------------------------------------------------
+# Integration tests for --unblock flag
+# ------------------------------------------------------------------
+
+class TestUpDownRm(_CmuxBase):
+    """Tests for cmux up / down (aliases) and cmux rm."""
+
+    def test_up_is_alias_for_start(self):
+        name = f'up{_rnd()}'
+        _cmux('up', name, '-d', state_dir=self.state_dir)
+        self._started.append(name)
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertIn(name, reg)
+
+    def test_up_creates_agent_home_dir(self):
+        name = f'up{_rnd()}'
+        _cmux('up', name, '-d', state_dir=self.state_dir)
+        self._started.append(name)
+        home = os.path.join(self.state_dir, name)
+        self.assertTrue(os.path.isdir(home), 'agent home dir should exist after up')
+
+    def test_start_still_works_as_alias(self):
+        name = f'st{_rnd()}'
+        _cmux('start', name, '-d', state_dir=self.state_dir)
+        self._started.append(name)
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertIn(name, reg)
+
+    def test_up_registers_agent_in_db(self):
+        """cmux up auto-registers even without prior agent register."""
+        name = f'up{_rnd()}'
+        _cmux('up', name, '-d', state_dir=self.state_dir)
+        self._started.append(name)
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT name FROM agents WHERE name = ?', (name,)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row, 'up should auto-register agent in agents.db')
+
+    def test_down_is_alias_for_stop(self):
+        name = f'dn{_rnd()}'
+        _cmux('up', name, '-d', state_dir=self.state_dir)
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _cmux('down', name, state_dir=self.state_dir)
+        self._started.remove(name) if name in self._started else None
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertNotIn(name, reg)
+
+    def test_rm_deregisters_agent_preserves_home(self):
+        name = f'rm{_rnd()}'
+        _cmux('up', name, '-d', state_dir=self.state_dir)
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _cmux('down', name, state_dir=self.state_dir)
+        self._started.remove(name) if name in self._started else None
+        home = os.path.join(self.state_dir, name)
+        self.assertTrue(os.path.isdir(home))
+
+        r = _cmux('rm', name, state_dir=self.state_dir)
+        # Home dir must survive — it has provenance (cq, logs, scripts)
+        self.assertTrue(os.path.isdir(home), 'home dir should be preserved after rm')
+        # DB entry must be gone
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT name FROM agents WHERE name = ?', (name,)).fetchone()
+        conn.close()
+        self.assertIsNone(row, 'agent should be de-registered from agents.db after rm')
+        self.assertIn('preserved', r.stdout)
+
+    def test_rm_refuses_running_agent(self):
+        name = f'rm{_rnd()}'
+        _cmux('up', name, '-d', state_dir=self.state_dir)
+        self._started.append(name)
+        r = _cmux('rm', name, state_dir=self.state_dir, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('down', r.stderr)
+
+
+class TestSessionContinuity(_CmuxBase):
+    """Tests for home dir scaffolding and --continue behaviour."""
+
+    def test_up_writes_identity_from_initial_prompt(self):
+        """cmux up writes initial_prompt to identity.md if identity.md absent."""
+        name = f'sc{_rnd()}'
+        _cmux('agent', 'register', name, '--', 'You are a test agent.', state_dir=self.state_dir)
+        self._start(name)
+        identity_path = os.path.join(self.state_dir, name, 'identity.md')
+        self.assertTrue(os.path.exists(identity_path))
+        self.assertIn('test agent', open(identity_path).read())
+
+    def test_up_does_not_overwrite_existing_identity(self):
+        """Existing identity.md is never overwritten by initial_prompt."""
+        name = f'sc{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        identity_path = os.path.join(home, 'identity.md')
+        with open(identity_path, 'w') as f:
+            f.write('Custom identity written by agent.')
+        _cmux('agent', 'register', name, '--', 'Overwrite attempt.', state_dir=self.state_dir)
+        self._start(name)
+        content = open(identity_path).read()
+        self.assertIn('Custom identity', content)
+        self.assertNotIn('Overwrite attempt', content)
+
+    def test_restart_succeeds_after_stop(self):
+        """cmux up after down starts the agent again (--continue is unconditional)."""
+        name = f'sc{_rnd()}'
+        self._start(name)
+        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _cmux('down', name, state_dir=self.state_dir)
+        self._started.remove(name) if name in self._started else None
+        _cmux('up', name, '-d', state_dir=self.state_dir)
+        self._started.append(name)
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertIn(name, reg)
+
+
+class TestUnblockIntegration(_CmuxBase):
+
+    def test_start_with_unblock_flag_recorded_in_registry(self):
+        """--unblock flag is stored in sessions.json."""
+        name = f'ub{_rnd()}'
+        self._start(name, '--unblock')
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        self.assertIn(name, reg)
+        self.assertTrue(reg[name].get('unblock'), 'unblock should be True in sessions.json')
+
+    def test_agent_register_with_unblock_persists_in_db(self):
+        """cmux agent register --unblock stores unblock=1 in agents.db."""
+        name = f'ub{_rnd()}'
+        _cmux('agent', 'register', name, '--unblock', state_dir=self.state_dir)
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT name, unblock FROM agents WHERE name = ?', (name,)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1], 1, 'unblock column should be 1')
 
 
 if __name__ == '__main__':
