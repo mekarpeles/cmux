@@ -158,14 +158,39 @@ def cmd_inbox(name):
     open(inbox_path, 'w').close()
 
 
-def _snapshot_claude_sessions():
-    """Return {filepath: mtime} for all current Claude session files."""
-    projects = os.path.expanduser('~/.claude/projects')
+# Overridable by tests via env vars or direct module assignment.
+# Set CMUX_SESSION_DETECT_RETRIES=1 CMUX_SESSION_DETECT_INTERVAL=0 to skip
+# waits in fake-claude environments (subprocess-spawned cmux reads these too).
+_SESSION_DETECT_RETRIES = int(os.environ.get('CMUX_SESSION_DETECT_RETRIES', '4'))
+_SESSION_DETECT_INTERVAL = int(os.environ.get('CMUX_SESSION_DETECT_INTERVAL', '3'))
+
+
+def _cwd_to_claude_project_dir(cwd):
+    """Map a filesystem path to the ~/.claude/projects subdirectory Claude uses for it."""
+    # Claude replaces every / in the absolute path with - to form the subdirectory name.
+    # e.g. /Users/mek/.cmux/alice -> ~/.claude/projects/-Users-mek-.cmux-alice
+    slug = cwd.replace('/', '-')
+    return os.path.join(os.path.expanduser('~/.claude/projects'), slug)
+
+
+def _snapshot_claude_sessions(project_dir=None):
+    """Return {filepath: mtime} for Claude session files.
+
+    project_dir: if given, scan only that subdirectory (scoped to one agent's CWD).
+    Otherwise scans all of ~/.claude/projects/ — use only when CWD is unknown.
+    """
+    projects_root = os.path.expanduser('~/.claude/projects')
     snapshot = {}
-    if not os.path.isdir(projects):
-        return snapshot
-    for proj in os.listdir(projects):
-        proj_path = os.path.join(projects, proj)
+    if project_dir:
+        dirs = [project_dir]
+    else:
+        if not os.path.isdir(projects_root):
+            return snapshot
+        dirs = [
+            os.path.join(projects_root, d)
+            for d in os.listdir(projects_root)
+        ]
+    for proj_path in dirs:
         if os.path.isdir(proj_path):
             for f in os.listdir(proj_path):
                 if f.endswith('.jsonl'):
@@ -177,22 +202,38 @@ def _snapshot_claude_sessions():
     return snapshot
 
 
-def _store_session_id(home, pre_snapshot):
-    """Detect which Claude session file is new/updated since pre_snapshot and store its UUID."""
-    post = _snapshot_claude_sessions()
-    candidates = [
-        fp for fp, mtime in post.items()
-        if fp not in pre_snapshot or mtime > pre_snapshot[fp]
-    ]
-    if not candidates:
-        return
-    newest = max(candidates, key=lambda fp: post[fp])
-    session_uuid = os.path.splitext(os.path.basename(newest))[0]
-    try:
-        with open(os.path.join(home, 'last-session-id'), 'w') as f:
-            f.write(session_uuid)
-    except OSError:
-        pass
+def _store_session_id(home, pre_snapshot, project_dir=None, retries=None, retry_interval=None):
+    """Detect and store the Claude session UUID for this agent.
+
+    Claude creates the JSONL lazily — often not until after the first message
+    exchange. Retries with delay so we catch it after message injection.
+    project_dir scopes the search to the agent's CWD to avoid picking up
+    other active sessions as false positives.
+
+    retries/retry_interval default to the module-level constants, which tests
+    can override to 1/0 to skip waits in fake-claude environments.
+    """
+    if retries is None:
+        retries = _SESSION_DETECT_RETRIES
+    if retry_interval is None:
+        retry_interval = _SESSION_DETECT_INTERVAL
+    for attempt in range(retries):
+        post = _snapshot_claude_sessions(project_dir=project_dir)
+        candidates = [
+            fp for fp, mtime in post.items()
+            if fp not in pre_snapshot or mtime > pre_snapshot[fp]
+        ]
+        if candidates:
+            newest = max(candidates, key=lambda fp: post[fp])
+            session_uuid = os.path.splitext(os.path.basename(newest))[0]
+            try:
+                with open(os.path.join(home, 'last-session-id'), 'w') as f:
+                    f.write(session_uuid)
+            except OSError:
+                pass
+            return
+        if attempt < retries - 1:
+            time.sleep(retry_interval)
 
 
 def _inject_identity(home):
@@ -275,8 +316,11 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     else:
         claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin}'
 
-    # Snapshot existing Claude session files so we can detect the new one after start.
-    _pre_sessions = _snapshot_claude_sessions()
+    # Scope session detection to the CWD we're launching from — avoids picking up
+    # other active Claude sessions as false positives.
+    _agent_cwd = os.getcwd()
+    _project_dir = _cwd_to_claude_project_dir(_agent_cwd)
+    _pre_sessions = _snapshot_claude_sessions(project_dir=_project_dir)
 
     sess_exists = subprocess.run(
         ['tmux', 'has-session', '-t', tmux_sess], capture_output=True
@@ -338,9 +382,6 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
 
     _wait_for_socket(reg[name]['socket'])
 
-    # Detect and store the Claude session ID so next restart uses --resume.
-    _store_session_id(home, _pre_sessions)
-
     cmux_info = (
         f'You are a cmux agent named "{name}". '
         f'Your home directory is {home} — your personal context, notes, and issue queue live there. '
@@ -358,6 +399,11 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     # Inject identity.md — gives the agent their role context on every startup
     # without relying solely on session history (which may be compacted).
     _inject_identity(home)
+
+    # Detect and store Claude session ID after message injection — JSONL is created
+    # lazily (often after the first exchange), so checking immediately after socket
+    # ready misses it. Retries with delay until the file appears.
+    _store_session_id(home, _pre_sessions, project_dir=_project_dir)
 
     # Inject workflow file if registered and readable.
     workflow_path = (reg_info.get('workflow_path') if reg_info else None)
@@ -723,7 +769,9 @@ def cmd_wizard():
     if os.path.exists(session_id_path):
         stored_id = open(session_id_path).read().strip() or None
 
-    pre_snapshot = _snapshot_claude_sessions()
+    # Scope snapshot to wizard_dir so other active sessions aren't picked up.
+    project_dir = _cwd_to_claude_project_dir(wizard_dir)
+    pre_snapshot = _snapshot_claude_sessions(project_dir=project_dir)
 
     print('cmux: launching wizard — your interactive cmux guide')
     print('      (/exit or Ctrl-C when done; next cmux --wizard resumes here)\n')
@@ -733,7 +781,9 @@ def cmd_wizard():
     subprocess.run(claude_args)
 
     # Store session ID so next run resumes this exact session.
-    _store_session_id(wizard_dir, pre_snapshot)
+    # No retries needed here — subprocess.run blocks until the user exits, so
+    # the JSONL definitely exists by the time we reach this line.
+    _store_session_id(wizard_dir, pre_snapshot, project_dir=project_dir, retries=1)
 
 
 # ------------------------------------------------------------------

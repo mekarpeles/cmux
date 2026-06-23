@@ -26,6 +26,9 @@ def _cmux(*args, state_dir, check=True):
     env = os.environ.copy()
     env['CMUX_STATE_DIR'] = state_dir
     env['CMUX_CLAUDE_CMD'] = f'{sys.executable} {FAKE_CLAUDE}'
+    # Disable session-detect retries — fake_claude creates no JSONL files.
+    env['CMUX_SESSION_DETECT_RETRIES'] = '1'
+    env['CMUX_SESSION_DETECT_INTERVAL'] = '0'
     return subprocess.run(
         [CMUX, *args],
         capture_output=True, text=True, env=env,
@@ -716,6 +719,11 @@ class TestUpDownRm(_CmuxBase):
 
 import cmux_lib.cli as _cli_module_for_session
 
+# Disable retry waits in all tests — fake_claude creates no real JSONL files,
+# so _store_session_id would otherwise sleep 4x3s per agent start.
+_cli_module_for_session._SESSION_DETECT_RETRIES = 1
+_cli_module_for_session._SESSION_DETECT_INTERVAL = 0
+
 
 class TestSessionContinuity(_CmuxBase):
     """Tests for home dir scaffolding, session ID tracking, workflow/identity injection."""
@@ -777,7 +785,7 @@ class TestSessionContinuity(_CmuxBase):
 
         # Patch the projects dir
         orig = _cli_module_for_session._snapshot_claude_sessions
-        def _patched_snapshot():
+        def _patched_snapshot(project_dir=None):
             snap = {}
             for f in os.listdir(proj_dir):
                 if f.endswith('.jsonl'):
@@ -799,6 +807,33 @@ class TestSessionContinuity(_CmuxBase):
         finally:
             _cli_module_for_session._snapshot_claude_sessions = orig
             shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(projects, ignore_errors=True)
+
+    def test_cwd_to_claude_project_dir(self):
+        """_cwd_to_claude_project_dir replaces / with - in the path."""
+        f = _cli_module_for_session._cwd_to_claude_project_dir
+        result = f('/Users/mek/.cmux/alice')
+        self.assertTrue(result.endswith('-Users-mek-.cmux-alice'))
+        self.assertIn('.claude/projects', result)
+
+    def test_snapshot_scoped_to_project_dir(self):
+        """_snapshot_claude_sessions with project_dir only returns files in that dir."""
+        import tempfile as _tf, uuid as _uuid
+        projects = _tf.mkdtemp(prefix='cmux-projects-')
+        dir_a = os.path.join(projects, 'dir-a')
+        dir_b = os.path.join(projects, 'dir-b')
+        os.makedirs(dir_a)
+        os.makedirs(dir_b)
+        uuid_a = str(_uuid.uuid4())
+        uuid_b = str(_uuid.uuid4())
+        open(os.path.join(dir_a, f'{uuid_a}.jsonl'), 'w').close()
+        open(os.path.join(dir_b, f'{uuid_b}.jsonl'), 'w').close()
+        try:
+            snap = _cli_module_for_session._snapshot_claude_sessions(project_dir=dir_a)
+            self.assertEqual(len(snap), 1)
+            self.assertIn(uuid_a, list(snap.keys())[0])
+            self.assertNotIn(uuid_b, ''.join(snap.keys()))
+        finally:
             shutil.rmtree(projects, ignore_errors=True)
 
     def test_identity_too_long_warns_to_stderr(self):
