@@ -33,7 +33,7 @@ Then show them how to open the agent's window:
 **5. TEACH THE ESSENTIALS**
 
 Cover these briefly:
-- `cmux down <name>` / `cmux up <name>` — stop and restart (session history is preserved via --continue)
+- `cmux down <name>` / `cmux up <name>` — stop and restart (session history preserved via --resume)
 - `cmux check` — scan all agents for stuck permission prompts
 - `cmux send <name> "message"` — deliver a message to any idle agent
 - `cq issue create -t "..."` — track tasks in the agent's personal issue queue (run this inside the agent's session)

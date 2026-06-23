@@ -193,20 +193,20 @@ cmux agent import-sessions
 
 ### Session continuity
 
-Each `cmux up` either starts a fresh session (first time) or resumes the previous one (`--continue`). The `.initialized` marker in the agent's home dir controls which.
+Each `cmux up` either starts a fresh Claude session (first time) or resumes via `--resume <uuid>`. The session UUID is detected after startup and stored in `~/.cmux/{name}/last-session-id`.
 
-**First start** — onboarding message sent, `identity.md` scaffolded from initial prompt:
+**First start** — `identity.md` scaffolded from initial prompt, orientation injected:
 
 ```bash
 cmux up alice -d -- "You are Alice, the auth specialist."
-# Writes ~/.cmux/alice/identity.md, sends onboarding, starts fresh Claude.
+# Writes ~/.cmux/alice/identity.md, sends orientation, starts fresh Claude.
 ```
 
-**Subsequent starts** — session resumes via `claude --continue`, brief orientation injected:
+**Subsequent starts** — session resumes via `claude --resume <uuid>`, orientation re-injected:
 
 ```bash
 cmux up alice -d
-# Resumes Alice's last conversation. Previous context is in session history.
+# Resumes Alice's exact last conversation. Previous context is in session history.
 ```
 
 **Agent home dir** — `~/.cmux/{name}/` persists across restarts. Agents use it for:

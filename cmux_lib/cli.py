@@ -264,9 +264,8 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         _shutil.copy2(_migrate_src, _migrate_dst)
 
     claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
-    # Use --resume <id> if we tracked the agent's last session, otherwise
-    # --continue (picks most recent session for this CWD — correct for solo
-    # agents, potentially wrong for shared-workspace agents before first tracked start).
+    # Use --resume <id> if we tracked the agent's last session, plain claude
+    # on first start (no flags = new session, which we then track for next time).
     session_id_path = os.path.join(home, 'last-session-id')
     stored_id = None
     if os.path.exists(session_id_path):
@@ -274,7 +273,7 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     if stored_id:
         claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin} --resume {stored_id}'
     else:
-        claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin} --continue'
+        claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin}'
 
     # Snapshot existing Claude session files so we can detect the new one after start.
     _pre_sessions = _snapshot_claude_sessions()
@@ -700,7 +699,7 @@ def cmd_wizard():
     as project context, so the wizard gets its full script with no flags needed.
 
     No agent name is claimed, no DB entry is created. The session lives in
-    ~/.cmux/.wizard/ and resumes via --continue on subsequent cmux --wizard calls.
+    ~/.cmux/.wizard/ and resumes via --resume <id> on subsequent cmux --wizard calls.
     """
     prompt_path = os.path.join(os.path.dirname(__file__), 'wizard.md')
     try:
@@ -719,8 +718,6 @@ def cmd_wizard():
     claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
 
     # Use --resume <id> if we have a stored session, plain claude on first run.
-    # --continue is not used here: it errors with "No conversation found" when
-    # the wizard dir has no prior Claude session.
     session_id_path = os.path.join(wizard_dir, 'last-session-id')
     stored_id = None
     if os.path.exists(session_id_path):
@@ -761,7 +758,7 @@ Usage:
   cmux check                                Check all agents for permission-prompt blockage
 
   start / stop still work as aliases for up / down.
-  First start launches fresh; subsequent starts resume via --continue.
+  First start launches fresh; subsequent starts resume via --resume <session-id>.
 
 Agent registry (persistent catalog):
   cmux agent register <name> [--role <r>] [--workspace <ws>] [--workflow <path>] [--no-inject] [--unblock] [-- "prompt"]

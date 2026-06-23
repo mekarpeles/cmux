@@ -137,11 +137,13 @@ Output is `[STUCK]` or `[OK]` per agent; prints the tmux target for quick `tmux 
 
 ---
 
-## Session continuity (`--continue`)
+## Session continuity (`--resume`)
 
-Every `cmux up` passes `--continue` to Claude Code unconditionally. If a prior session exists for that CWD, it is resumed. If not (first start, or session was never saved), Claude Code starts fresh — `--continue` is a no-op in that case, not an error.
+`cmux up` uses `--resume <uuid>` when a stored session ID exists, and plain `claude` (no flags) on the very first start. After the daemon socket is ready, cmux scans `~/.claude/projects/` for session files that are new or updated since the pre-start snapshot; the UUID of the newest candidate is written to `~/.cmux/{name}/last-session-id` so the next restart can resume exactly.
 
-**Scaffolding** — files written to `~/.cmux/{name}/` when missing (no "first start" detection needed):
+`--continue` is never used: it picks the most recently modified session for the CWD, which is the wrong agent when multiple agents share a workspace directory, and produces "No conversation found" errors in fresh directories.
+
+**Scaffolding** — files written to `~/.cmux/{name}/` when missing:
 - `identity.md` — written from `initial_prompt` if the file doesn't exist yet. The agent can edit this file; cmux will never overwrite it.
 - `MIGRATE.md` — brain migration checklist, written once.
 
@@ -150,8 +152,6 @@ On every `cmux up`, after the socket is ready, cmux injects two messages:
 2. Contents of `identity.md` — so role context is always at the top of the conversation, even after heavy session compaction.
 
 **Why inject identity.md on every start, not just first start:** Session compaction can evict the agent's role definition from the active context window. Injecting it on every startup is cheap and ensures the agent always knows who they are, regardless of history depth.
-
-**Workspace session isolation**: after the daemon socket is ready, cmux scans `~/.claude/projects/` for session files that are new or updated since the pre-start snapshot. The UUID of the newest candidate is written to `~/.cmux/{name}/last-session-id`. On the next restart, cmux uses `claude --resume <uuid>` instead of `--continue`, so workspace agents (`fran`, `pierre`, etc.) that share `~/Projects/pm` as their CWD each resume their own session rather than the most recently modified one in that directory.
 
 ---
 
