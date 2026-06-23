@@ -718,13 +718,25 @@ def cmd_wizard():
 
     claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
 
+    # Use --resume <id> if we have a stored session, plain claude on first run.
+    # --continue is not used here: it errors with "No conversation found" when
+    # the wizard dir has no prior Claude session.
+    session_id_path = os.path.join(wizard_dir, 'last-session-id')
+    stored_id = None
+    if os.path.exists(session_id_path):
+        stored_id = open(session_id_path).read().strip() or None
+
+    pre_snapshot = _snapshot_claude_sessions()
+
     print('cmux: launching wizard — your interactive cmux guide')
     print('      (/exit or Ctrl-C when done; next cmux --wizard resumes here)\n')
 
-    # cd into wizard dir so Claude picks up CLAUDE.md, then exec claude --continue
-    # (--continue resumes the prior session if one exists; starts fresh otherwise).
     os.chdir(wizard_dir)
-    os.execvp(claude_bin, [claude_bin, '--continue'])
+    claude_args = [claude_bin, '--resume', stored_id] if stored_id else [claude_bin]
+    subprocess.run(claude_args)
+
+    # Store session ID so next run resumes this exact session.
+    _store_session_id(wizard_dir, pre_snapshot)
 
 
 # ------------------------------------------------------------------

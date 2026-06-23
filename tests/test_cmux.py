@@ -855,7 +855,9 @@ class TestWizard(unittest.TestCase):
     def test_wizard_writes_claude_md_from_wizard_md(self):
         """cmd_wizard writes wizard.md content as CLAUDE.md into .wizard dir."""
         from unittest.mock import patch as _patch
-        with _patch('os.execvp'), _patch('os.chdir'):
+        with _patch('subprocess.run'), _patch('os.chdir'), \
+             _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
+             _patch.object(_cli_module_for_session, '_store_session_id'):
             _cli_module_for_session.cmd_wizard()
         claude_md = os.path.join(self.state_dir, '.wizard', 'CLAUDE.md')
         self.assertTrue(os.path.exists(claude_md))
@@ -865,19 +867,39 @@ class TestWizard(unittest.TestCase):
     def test_wizard_dir_created_in_state_dir(self):
         """~/.cmux/.wizard/ directory is created by cmd_wizard."""
         from unittest.mock import patch as _patch
-        with _patch('os.execvp'), _patch('os.chdir'):
+        with _patch('subprocess.run'), _patch('os.chdir'), \
+             _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
+             _patch.object(_cli_module_for_session, '_store_session_id'):
             _cli_module_for_session.cmd_wizard()
         wizard_dir = os.path.join(self.state_dir, '.wizard')
         self.assertTrue(os.path.isdir(wizard_dir))
 
-    def test_wizard_execs_claude_with_continue(self):
-        """cmd_wizard calls os.execvp with claude --continue."""
-        from unittest.mock import patch as _patch, call as _call
-        with _patch('os.execvp') as mock_exec, _patch('os.chdir'):
+    def test_wizard_runs_claude_no_flags_on_first_run(self):
+        """cmd_wizard calls subprocess.run with plain claude (no --continue) on first run."""
+        from unittest.mock import patch as _patch
+        with _patch('subprocess.run') as mock_run, _patch('os.chdir'), \
+             _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
+             _patch.object(_cli_module_for_session, '_store_session_id'):
             _cli_module_for_session.cmd_wizard()
-        mock_exec.assert_called_once()
-        _, exec_args = mock_exec.call_args[0]
-        self.assertIn('--continue', exec_args)
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        self.assertNotIn('--continue', args)
+        self.assertNotIn('--resume', args)
+
+    def test_wizard_resumes_with_stored_session_id(self):
+        """cmd_wizard uses --resume <id> when last-session-id exists."""
+        from unittest.mock import patch as _patch
+        wizard_dir = os.path.join(self.state_dir, '.wizard')
+        os.makedirs(wizard_dir, exist_ok=True)
+        session_id_path = os.path.join(wizard_dir, 'last-session-id')
+        open(session_id_path, 'w').write('abc-123-def')
+        with _patch('subprocess.run') as mock_run, _patch('os.chdir'), \
+             _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
+             _patch.object(_cli_module_for_session, '_store_session_id'):
+            _cli_module_for_session.cmd_wizard()
+        args = mock_run.call_args[0][0]
+        self.assertIn('--resume', args)
+        self.assertIn('abc-123-def', args)
 
 
 class TestUnblockIntegration(_CmuxBase):
