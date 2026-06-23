@@ -151,7 +151,7 @@ On every `cmux up`, after the socket is ready, cmux injects two messages:
 
 **Why inject identity.md on every start, not just first start:** Session compaction can evict the agent's role definition from the active context window. Injecting it on every startup is cheap and ensures the agent always knows who they are, regardless of history depth.
 
-**Shared workspace caveat**: `--continue` resumes by CWD. Agents that share a workspace (`~/Projects/pm`) all have sessions in the same `~/.claude/projects/<hash>/` directory. Claude Code picks the most recent session, which may be a different agent's. In practice this is acceptable (each agent's session is their own process), but the clean fix is `--resume <session-id>` with a per-agent stored ID — a future improvement.
+**Workspace session isolation**: after the daemon socket is ready, cmux scans `~/.claude/projects/` for session files that are new or updated since the pre-start snapshot. The UUID of the newest candidate is written to `~/.cmux/{name}/last-session-id`. On the next restart, cmux uses `claude --resume <uuid>` instead of `--continue`, so workspace agents (`fran`, `pierre`, etc.) that share `~/Projects/pm` as their CWD each resume their own session rather than the most recently modified one in that directory.
 
 ---
 
