@@ -737,15 +737,30 @@ def cmd_check():
         print(f'All {len(ok)} agent(s) OK.')
 
 
+def cmd_run(prompt):
+    """Run an ephemeral Claude session with `prompt` written as CLAUDE.md.
+
+    No home dir, no agent registry entry, no session tracking. The temp dir
+    is deleted on exit — every invocation starts completely fresh.
+    """
+    import shutil as _shutil
+    import tempfile as _tempfile
+    claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
+    tmp = _tempfile.mkdtemp(prefix='cmux-run-')
+    try:
+        with open(os.path.join(tmp, 'CLAUDE.md'), 'w') as f:
+            f.write(prompt)
+        os.chdir(tmp)
+        subprocess.run([claude_bin])
+    finally:
+        os.chdir(os.path.expanduser('~'))
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
 def cmd_wizard():
-    """Launch the cmux wizard — an interactive onboarding guide.
+    """Launch the cmux onboarding wizard as an ephemeral session.
 
-    Runs claude directly in the current terminal from ~/.cmux/.wizard/, where
-    wizard.md is installed as CLAUDE.md. Claude Code loads CLAUDE.md automatically
-    as project context, so the wizard gets its full script with no flags needed.
-
-    No agent name is claimed, no DB entry is created. The session lives in
-    ~/.cmux/.wizard/ and resumes via --resume <id> on subsequent cmux --wizard calls.
+    Each run is completely fresh — no home dir, no session tracking.
     """
     prompt_path = os.path.join(os.path.dirname(__file__), 'wizard.md')
     try:
@@ -754,49 +769,11 @@ def cmd_wizard():
         print(f'cmux: wizard prompt not found at {prompt_path}', file=sys.stderr)
         sys.exit(1)
 
-    wizard_dir = os.path.join(STATE_DIR, '.wizard')
-    os.makedirs(wizard_dir, exist_ok=True)
-
-    claude_md = os.path.join(wizard_dir, 'CLAUDE.md')
-    with open(claude_md, 'w') as f:
-        f.write(wizard_prompt)
-
-    claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
-
-    # Use --resume <id> if we have a stored session, plain claude on first run.
-    session_id_path = os.path.join(wizard_dir, 'last-session-id')
-    stored_id = None
-    if os.path.exists(session_id_path):
-        stored_id = open(session_id_path).read().strip() or None
-
-    # Scope snapshot to wizard_dir so other active sessions aren't picked up.
-    project_dir = _cwd_to_claude_project_dir(wizard_dir)
-    pre_snapshot = _snapshot_claude_sessions(project_dir=project_dir)
-
     print('cmux: launching wizard — your interactive cmux guide')
     print('      (Type anything to start — "hi" works fine)')
-    print('      (/exit or Ctrl-C when done; next cmux --wizard resumes here)\n')
+    print('      (/exit or Ctrl-C when done)\n')
 
-    os.chdir(wizard_dir)
-    if stored_id:
-        start = time.monotonic()
-        result = subprocess.run([claude_bin, '--resume', stored_id])
-        elapsed = time.monotonic() - start
-        if result.returncode != 0 and elapsed < 5:
-            # --resume failed immediately (stale/invalid UUID). Clear the bad ID
-            # and start a fresh session instead.
-            try:
-                os.unlink(session_id_path)
-            except OSError:
-                pass
-            pre_snapshot = _snapshot_claude_sessions(project_dir=project_dir)
-            subprocess.run([claude_bin])
-    else:
-        subprocess.run([claude_bin])
-
-    # Store session ID so next run resumes this exact session.
-    # No retries needed — subprocess.run blocked until the user exited.
-    _store_session_id(wizard_dir, pre_snapshot, project_dir=project_dir, retries=1)
+    cmd_run(wizard_prompt)
 
 
 # ------------------------------------------------------------------
@@ -808,6 +785,7 @@ cmux — Claude Code multiplexer
 
 Usage:
   cmux --wizard                             Interactive onboarding guide (start here!)
+  cmux run "<system prompt>"                Ephemeral Claude session — no home dir, no history
   cmux [-s workspace] <agent>               Bring agent up and attach (shorthand)
   cmux [-s workspace] up <agent> [-d] [--no-inject] [--unblock] [-- "initial prompt"]
   cmux [-s workspace] down <agent>          Take agent offline (home dir preserved)
@@ -855,6 +833,13 @@ def main():
 
     if args[0] in ('--wizard', 'wizard'):
         cmd_wizard()
+        return
+
+    if args[0] == 'run':
+        if len(args) < 2:
+            print('Usage: cmux run "<system prompt>"', file=sys.stderr)
+            sys.exit(1)
+        cmd_run(args[1])
         return
 
     _require_tmux()

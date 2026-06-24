@@ -875,69 +875,66 @@ class TestSessionContinuity(_CmuxBase):
             os.unlink(wf_file.name)
 
 
-class TestWizard(unittest.TestCase):
-    """Unit tests for cmd_wizard — no tmux or claude needed."""
+class TestEphemeralRun(unittest.TestCase):
+    """Tests for cmd_run (ephemeral sessions) and cmd_wizard (which uses cmd_run)."""
 
-    def setUp(self):
-        self.state_dir = tempfile.mkdtemp(prefix='cmux-wizard-test-')
-        self._orig_state = _cli_module_for_session.STATE_DIR
-        _cli_module_for_session.STATE_DIR = self.state_dir
-
-    def tearDown(self):
-        _cli_module_for_session.STATE_DIR = self._orig_state
-        shutil.rmtree(self.state_dir, ignore_errors=True)
-
-    def test_wizard_writes_claude_md_from_wizard_md(self):
-        """cmd_wizard writes wizard.md content as CLAUDE.md into .wizard dir."""
+    def test_run_writes_prompt_as_claude_md(self):
+        """cmd_run writes the prompt as CLAUDE.md in the temp dir."""
         from unittest.mock import patch as _patch
-        with _patch('subprocess.run'), _patch('os.chdir'), \
-             _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
-             _patch.object(_cli_module_for_session, '_store_session_id'):
-            _cli_module_for_session.cmd_wizard()
-        claude_md = os.path.join(self.state_dir, '.wizard', 'CLAUDE.md')
-        self.assertTrue(os.path.exists(claude_md))
-        content = open(claude_md).read()
-        self.assertIn('wizard', content.lower())
+        captured = {}
+        tmp_path = {}
+        def fake_chdir(path):
+            tmp_path['dir'] = path  # record temp dir without actually changing CWD
+        def fake_run(args):
+            d = tmp_path.get('dir', '')
+            claude_md = os.path.join(d, 'CLAUDE.md')
+            if d and os.path.exists(claude_md):
+                captured['content'] = open(claude_md).read()
+        with _patch('subprocess.run', side_effect=fake_run), \
+             _patch('os.chdir', side_effect=fake_chdir):
+            _cli_module_for_session.cmd_run('hello from test')
+        self.assertEqual(captured.get('content'), 'hello from test')
 
-    def test_wizard_dir_created_in_state_dir(self):
-        """~/.cmux/.wizard/ directory is created by cmd_wizard."""
+    def test_run_calls_plain_claude_no_flags(self):
+        """cmd_run uses plain claude with no --resume or --continue."""
         from unittest.mock import patch as _patch
-        with _patch('subprocess.run'), _patch('os.chdir'), \
-             _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
-             _patch.object(_cli_module_for_session, '_store_session_id'):
-            _cli_module_for_session.cmd_wizard()
-        wizard_dir = os.path.join(self.state_dir, '.wizard')
-        self.assertTrue(os.path.isdir(wizard_dir))
-
-    def test_wizard_runs_claude_no_flags_on_first_run(self):
-        """cmd_wizard calls subprocess.run with plain claude (no --continue) on first run."""
-        from unittest.mock import patch as _patch
-        with _patch('subprocess.run') as mock_run, _patch('os.chdir'), \
-             _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
-             _patch.object(_cli_module_for_session, '_store_session_id'):
-            _cli_module_for_session.cmd_wizard()
-        mock_run.assert_called_once()
+        with _patch('subprocess.run') as mock_run, _patch('os.chdir'):
+            _cli_module_for_session.cmd_run('test prompt')
         args = mock_run.call_args[0][0]
-        self.assertNotIn('--continue', args)
         self.assertNotIn('--resume', args)
+        self.assertNotIn('--continue', args)
 
-    def test_wizard_resumes_with_stored_session_id(self):
-        """cmd_wizard uses --resume <id> when last-session-id exists."""
-        from unittest.mock import patch as _patch, MagicMock
-        wizard_dir = os.path.join(self.state_dir, '.wizard')
-        os.makedirs(wizard_dir, exist_ok=True)
-        session_id_path = os.path.join(wizard_dir, 'last-session-id')
-        open(session_id_path, 'w').write('abc-123-def')
-        mock_result = MagicMock()
-        mock_result.returncode = 0  # simulate successful --resume (no fallback)
-        with _patch('subprocess.run', return_value=mock_result) as mock_run, \
-             _patch('os.chdir'), \
-             _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
-             _patch.object(_cli_module_for_session, '_store_session_id'):
+    def test_run_cleans_up_temp_dir(self):
+        """cmd_run removes the temp dir after claude exits."""
+        from unittest.mock import patch as _patch
+        tmp_path = {}
+        def fake_chdir(path):
+            if 'dir' not in tmp_path:  # capture only the first chdir (to temp dir)
+                tmp_path['dir'] = path
+        with _patch('subprocess.run'), _patch('os.chdir', side_effect=fake_chdir):
+            _cli_module_for_session.cmd_run('cleanup test')
+        d = tmp_path.get('dir', '')
+        self.assertTrue(d, 'expected os.chdir to be called with temp dir')
+        self.assertFalse(os.path.exists(d), 'temp dir should be deleted after cmd_run')
+
+    def test_wizard_calls_cmd_run_with_wizard_prompt(self):
+        """cmd_wizard delegates to cmd_run with wizard.md content."""
+        from unittest.mock import patch as _patch
+        received = {}
+        def fake_cmd_run(prompt):
+            received['prompt'] = prompt
+        with _patch.object(_cli_module_for_session, 'cmd_run', side_effect=fake_cmd_run):
             _cli_module_for_session.cmd_wizard()
-        first_call_args = mock_run.call_args_list[0][0][0]
-        self.assertIn('--resume', first_call_args)
-        self.assertIn('abc-123-def', first_call_args)
+        self.assertIn('wizard', received.get('prompt', '').lower())
+
+    def test_wizard_is_always_fresh_no_resume(self):
+        """cmd_wizard never uses --resume — each run is a fresh ephemeral session."""
+        from unittest.mock import patch as _patch
+        with _patch('subprocess.run') as mock_run, _patch('os.chdir'):
+            _cli_module_for_session.cmd_wizard()
+        for call in mock_run.call_args_list:
+            args = call[0][0]
+            self.assertNotIn('--resume', args)
 
 
 class TestUnblockIntegration(_CmuxBase):
