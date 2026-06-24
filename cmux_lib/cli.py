@@ -774,6 +774,7 @@ def cmd_wizard():
     pre_snapshot = _snapshot_claude_sessions(project_dir=project_dir)
 
     print('cmux: launching wizard — your interactive cmux guide')
+    print('      (Type anything to start — "hi" works fine)')
     print('      (/exit or Ctrl-C when done; next cmux --wizard resumes here)\n')
 
     os.chdir(wizard_dir)
