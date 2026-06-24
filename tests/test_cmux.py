@@ -917,24 +917,76 @@ class TestEphemeralRun(unittest.TestCase):
         self.assertTrue(d, 'expected os.chdir to be called with temp dir')
         self.assertFalse(os.path.exists(d), 'temp dir should be deleted after cmd_run')
 
-    def test_wizard_calls_cmd_run_with_wizard_prompt(self):
-        """cmd_wizard delegates to cmd_run with wizard.md content."""
-        from unittest.mock import patch as _patch
-        received = {}
-        def fake_cmd_run(prompt):
-            received['prompt'] = prompt
-        with _patch.object(_cli_module_for_session, 'cmd_run', side_effect=fake_cmd_run):
-            _cli_module_for_session.cmd_wizard()
-        self.assertIn('wizard', received.get('prompt', '').lower())
+    def test_wizard_writes_wizard_md_as_claude_md(self):
+        """cmd_wizard writes wizard.md content as CLAUDE.md in the temp dir."""
+        import json as _json
+        from unittest.mock import patch as _patch, MagicMock
+        captured = {}
+        tmp_path = {}
 
-    def test_wizard_is_always_fresh_no_resume(self):
-        """cmd_wizard never uses --resume — each run is a fresh ephemeral session."""
-        from unittest.mock import patch as _patch
-        with _patch('subprocess.run') as mock_run, _patch('os.chdir'):
+        def fake_chdir(path):
+            if 'dir' not in tmp_path:
+                tmp_path['dir'] = path
+
+        boot = MagicMock()
+        boot.returncode = 0
+        boot.stdout = _json.dumps({'result': 'Hi!', 'session_id': 'xyz'})
+
+        def fake_run(args, **kwargs):
+            d = tmp_path.get('dir', '')
+            claude_md = os.path.join(d, 'CLAUDE.md') if d else ''
+            if d and os.path.exists(claude_md):
+                captured['content'] = open(claude_md).read()
+            return boot
+
+        with _patch('subprocess.run', side_effect=fake_run), \
+             _patch('os.chdir', side_effect=fake_chdir):
             _cli_module_for_session.cmd_wizard()
-        for call in mock_run.call_args_list:
-            args = call[0][0]
-            self.assertNotIn('--resume', args)
+        self.assertIn('wizard', captured.get('content', '').lower())
+
+    def test_wizard_bootstraps_then_resumes(self):
+        """cmd_wizard runs a -p boot call first, then resumes interactively."""
+        import json as _json
+        from unittest.mock import patch as _patch, MagicMock
+        calls = []
+
+        boot = MagicMock()
+        boot.returncode = 0
+        boot.stdout = _json.dumps({'result': 'Hi! Wizard pitch.', 'session_id': 'boot-sid-42'})
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return boot
+
+        with _patch('subprocess.run', side_effect=fake_run), _patch('os.chdir'):
+            _cli_module_for_session.cmd_wizard()
+
+        boot_calls = [c for c in calls if '-p' in c]
+        resume_calls = [c for c in calls if '--resume' in c]
+        self.assertTrue(boot_calls, 'expected a -p boot call')
+        self.assertIn('--output-format', boot_calls[0])
+        self.assertTrue(resume_calls, 'expected a --resume call')
+        self.assertIn('boot-sid-42', resume_calls[0])
+
+    def test_wizard_falls_back_to_plain_if_bootstrap_fails(self):
+        """cmd_wizard falls back to plain interactive if the -p boot call fails."""
+        from unittest.mock import patch as _patch, MagicMock
+        calls = []
+
+        failed = MagicMock()
+        failed.returncode = 1
+        failed.stdout = ''
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return failed
+
+        with _patch('subprocess.run', side_effect=fake_run), _patch('os.chdir'):
+            _cli_module_for_session.cmd_wizard()
+
+        self.assertEqual(len(calls), 2, 'expected boot call + fallback call')
+        self.assertIn('-p', calls[0])
+        self.assertNotIn('--resume', calls[1])
 
 
 class TestUnblockIntegration(_CmuxBase):

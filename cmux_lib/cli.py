@@ -760,8 +760,15 @@ def cmd_run(prompt):
 def cmd_wizard():
     """Launch the cmux onboarding wizard as an ephemeral session.
 
+    Bootstraps by running the opening pitch non-interactively first so the
+    wizard speaks immediately, then resumes the same session interactively.
     Each run is completely fresh — no home dir, no session tracking.
     """
+    import json as _json
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
     prompt_path = os.path.join(os.path.dirname(__file__), 'wizard.md')
     try:
         wizard_prompt = open(prompt_path).read().strip()
@@ -769,11 +776,37 @@ def cmd_wizard():
         print(f'cmux: wizard prompt not found at {prompt_path}', file=sys.stderr)
         sys.exit(1)
 
-    print('cmux: launching wizard — your interactive cmux guide')
-    print('      (Type anything to start — "hi" works fine)')
-    print('      (/exit or Ctrl-C when done)\n')
+    tmp = _tempfile.mkdtemp(prefix='cmux-wizard-')
+    try:
+        with open(os.path.join(tmp, 'CLAUDE.md'), 'w') as f:
+            f.write(wizard_prompt)
+        os.chdir(tmp)
 
-    cmd_run(wizard_prompt)
+        # Bootstrap: non-interactive run to trigger STEP 0 and capture session ID.
+        boot = subprocess.run(
+            [claude_bin, '-p', '.', '--output-format', 'json'],
+            capture_output=True, text=True,
+        )
+        session_id = None
+        if boot.returncode == 0 and boot.stdout.strip():
+            try:
+                data = _json.loads(boot.stdout)
+                session_id = data.get('session_id')
+                pitch = data.get('result', '').strip()
+                if pitch:
+                    print(pitch)
+                    print()
+            except (_json.JSONDecodeError, AttributeError):
+                pass
+
+        if session_id:
+            subprocess.run([claude_bin, '--resume', session_id])
+        else:
+            print('cmux: type anything to begin (try "hi")')
+            subprocess.run([claude_bin])
+    finally:
+        os.chdir(os.path.expanduser('~'))
+        _shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ------------------------------------------------------------------
