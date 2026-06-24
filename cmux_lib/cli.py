@@ -237,24 +237,12 @@ def _store_session_id(home, pre_snapshot, project_dir=None, retries=None, retry_
 
 
 def _inject_identity(home):
-    """Inject identity.md contents as a cmux message. Warns to stderr if too long."""
+    """Send a @ file reference for identity.md so the agent orients themselves."""
     identity_path = os.path.join(home, 'identity.md')
     if not os.path.exists(identity_path):
         return
-    try:
-        content = open(identity_path).read().strip()
-    except Exception:
-        return
-    if not content:
-        return
-    msg = f'[cmux]: Your identity/role context from {identity_path}:\n\n{content}'
     name = os.path.basename(home)
-    if len(msg) <= MAX_MESSAGE_LEN:
-        cmd_send(name, msg, sender='cmux')
-    else:
-        # Too long to inject verbatim — send a pointer so the agent reads it themselves.
-        pointer = f'[cmux]: Read {identity_path} to orient yourself.'
-        cmd_send(name, pointer, sender='cmux')
+    cmd_send(name, f'[cmux]: @{identity_path}', sender='cmux')
 
 
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False, unblock=False):
