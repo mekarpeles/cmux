@@ -248,17 +248,13 @@ def _inject_identity(home):
     if not content:
         return
     msg = f'[cmux]: Your identity/role context from {identity_path}:\n\n{content}'
+    name = os.path.basename(home)
     if len(msg) <= MAX_MESSAGE_LEN:
-        # Derive agent name from home dir basename for cmd_send
-        name = os.path.basename(home)
         cmd_send(name, msg, sender='cmux')
     else:
-        print(
-            f'cmux: warning — {identity_path} is too long to inject '
-            f'({len(msg)} chars, limit {MAX_MESSAGE_LEN}). '
-            f'Trim it or split role definition from procedures into a separate workflow file.',
-            file=sys.stderr,
-        )
+        # Too long to inject verbatim — send a pointer so the agent reads it themselves.
+        pointer = f'[cmux]: Read {identity_path} to orient yourself.'
+        cmd_send(name, pointer, sender='cmux')
 
 
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False, unblock=False):

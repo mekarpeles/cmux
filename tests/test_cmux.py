@@ -836,20 +836,20 @@ class TestSessionContinuity(_CmuxBase):
         finally:
             shutil.rmtree(projects, ignore_errors=True)
 
-    def test_identity_too_long_warns_to_stderr(self):
-        """Oversized identity.md prints a warning instead of silently doing nothing."""
-        import io
-        from unittest.mock import patch as _patch
+    def test_identity_too_long_sends_read_pointer(self):
+        """Oversized identity.md sends a file-read pointer instead of dropping content."""
+        from unittest.mock import patch as _patch, call
         home = tempfile.mkdtemp(prefix='cmux-id-test-')
         identity_path = os.path.join(home, 'identity.md')
         try:
             with open(identity_path, 'w') as f:
                 f.write('x' * 2000)  # wrapped message will exceed MAX_MESSAGE_LEN
-            buf = io.StringIO()
-            with _patch('cmux_lib.cli.cmd_send'):
-                with _patch('sys.stderr', buf):
-                    _cli_module_for_session._inject_identity(home)
-            self.assertIn('too long', buf.getvalue())
+            with _patch('cmux_lib.cli.cmd_send') as mock_send:
+                _cli_module_for_session._inject_identity(home)
+            mock_send.assert_called_once()
+            sent_msg = mock_send.call_args[0][1]
+            self.assertIn('identity.md', sent_msg)
+            self.assertIn('Read', sent_msg)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
