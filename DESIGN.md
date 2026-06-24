@@ -139,19 +139,51 @@ Output is `[STUCK]` or `[OK]` per agent; prints the tmux target for quick `tmux 
 
 ## Session continuity (`--resume`)
 
-`cmux up` uses `--resume <uuid>` when a stored session ID exists, and plain `claude` (no flags) on the very first start. After the daemon socket is ready, cmux scans `~/.claude/projects/` for session files that are new or updated since the pre-start snapshot; the UUID of the newest candidate is written to `~/.cmux/{name}/last-session-id` so the next restart can resume exactly.
+`cmux up` uses `--resume <uuid>` when a stored session ID exists, and plain `claude` (no flags) on the very first start. After injecting the startup messages, cmux detects the new session file and writes its UUID to `~/.cmux/{name}/last-session-id` so the next restart can resume exactly.
 
 `--continue` is never used: it picks the most recently modified session for the CWD, which is the wrong agent when multiple agents share a workspace directory, and produces "No conversation found" errors in fresh directories.
+
+**Session file detection** (`_store_session_id` in cli.py): Claude creates the JSONL file lazily — often not until after the first message exchange, not at startup. Detection runs *after* all messages are injected, and retries up to 4× with 3s intervals. The scan is scoped to `~/.claude/projects/<cwd-slug>/` (where `cwd-slug` replaces every `/` in the launch CWD with `-`) so other active sessions can't be falsely picked up. Retry timing is controlled by `CMUX_SESSION_DETECT_RETRIES` and `CMUX_SESSION_DETECT_INTERVAL` env vars (tests set both to `1`/`0` to skip waits).
 
 **Scaffolding** — files written to `~/.cmux/{name}/` when missing:
 - `identity.md` — written from `initial_prompt` if the file doesn't exist yet. The agent can edit this file; cmux will never overwrite it.
 - `MIGRATE.md` — brain migration checklist, written once.
 
-On every `cmux up`, after the socket is ready, cmux injects two messages:
-1. Orientation (name, home dir, cq, messaging protocol) — same message every time.
-2. Contents of `identity.md` — so role context is always at the top of the conversation, even after heavy session compaction.
+On every `cmux up`, after the socket is ready, cmux injects messages in order:
+1. Orientation (name, home dir, cq, messaging protocol) — same every time.
+2. Contents of `identity.md` — so role context survives heavy session compaction.
+3. Workflow file contents (if a workflow path is registered in agents.db).
 
 **Why inject identity.md on every start, not just first start:** Session compaction can evict the agent's role definition from the active context window. Injecting it on every startup is cheap and ensures the agent always knows who they are, regardless of history depth.
+
+---
+
+## `cmux --wizard`
+
+An ephemeral onboarding session for new users. No agent name is claimed, no DB entry created.
+
+```bash
+cmux --wizard
+```
+
+Writes `~/.cmux/.wizard/CLAUDE.md` from the bundled `cmux_lib/wizard.md` script, then launches `claude` from that directory so Claude Code picks up CLAUDE.md as project context. The wizard walks the user through: what cmux/claudio is → naming their first agent → defining its role → spinning it up → sending a first message → tmux navigation → essentials.
+
+Session continuity uses the same `--resume <uuid>` pattern: on first run, plain `claude`; on subsequent runs, `claude --resume <stored-id>`. The session ID is stored in `~/.cmux/.wizard/last-session-id` after the user exits (no retries needed — subprocess blocks until exit, so the JSONL definitely exists).
+
+---
+
+## Future direction: hooks-based idle detection
+
+The current message delivery pipeline uses polling + `tmux send-keys`: the daemon polls `is_idle()` (cursor heuristics) every ~200ms and injects text when idle. This is fragile — prompt format changes break it silently, and a human typing in the pane can delay delivery.
+
+Claude Code has a `Stop` hook that fires when Claude finishes a response and is waiting for input — the exact idle moment the daemon currently detects heuristically. A hooks-based approach could eliminate polling entirely.
+
+The open question is **injection**: hooks run a shell command, they don't feed text back into Claude's stdin. Possible paths:
+- `Stop` hook as trigger + `tmux send-keys` targeted delivery (keeps tmux dependency but removes polling/cursor heuristics entirely — event-driven instead)
+- PTY stdin injection from the hook (OS-level write to the process's TTY, bypasses tmux)
+- Whether Claude Code exposes any stdin/turn-injection API from hooks (unknown)
+
+The `Notification` hook may be more targeted than `Stop` if a specific notification type fires only at the "waiting for user input" state (vs. after every tool use). Worth investigating what notification types Claude Code actually emits before committing to an approach.
 
 ---
 

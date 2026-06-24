@@ -923,18 +923,21 @@ class TestWizard(unittest.TestCase):
 
     def test_wizard_resumes_with_stored_session_id(self):
         """cmd_wizard uses --resume <id> when last-session-id exists."""
-        from unittest.mock import patch as _patch
+        from unittest.mock import patch as _patch, MagicMock
         wizard_dir = os.path.join(self.state_dir, '.wizard')
         os.makedirs(wizard_dir, exist_ok=True)
         session_id_path = os.path.join(wizard_dir, 'last-session-id')
         open(session_id_path, 'w').write('abc-123-def')
-        with _patch('subprocess.run') as mock_run, _patch('os.chdir'), \
+        mock_result = MagicMock()
+        mock_result.returncode = 0  # simulate successful --resume (no fallback)
+        with _patch('subprocess.run', return_value=mock_result) as mock_run, \
+             _patch('os.chdir'), \
              _patch.object(_cli_module_for_session, '_snapshot_claude_sessions', return_value={}), \
              _patch.object(_cli_module_for_session, '_store_session_id'):
             _cli_module_for_session.cmd_wizard()
-        args = mock_run.call_args[0][0]
-        self.assertIn('--resume', args)
-        self.assertIn('abc-123-def', args)
+        first_call_args = mock_run.call_args_list[0][0][0]
+        self.assertIn('--resume', first_call_args)
+        self.assertIn('abc-123-def', first_call_args)
 
 
 class TestUnblockIntegration(_CmuxBase):

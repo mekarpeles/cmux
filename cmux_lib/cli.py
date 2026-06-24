@@ -777,12 +777,24 @@ def cmd_wizard():
     print('      (/exit or Ctrl-C when done; next cmux --wizard resumes here)\n')
 
     os.chdir(wizard_dir)
-    claude_args = [claude_bin, '--resume', stored_id] if stored_id else [claude_bin]
-    subprocess.run(claude_args)
+    if stored_id:
+        start = time.monotonic()
+        result = subprocess.run([claude_bin, '--resume', stored_id])
+        elapsed = time.monotonic() - start
+        if result.returncode != 0 and elapsed < 5:
+            # --resume failed immediately (stale/invalid UUID). Clear the bad ID
+            # and start a fresh session instead.
+            try:
+                os.unlink(session_id_path)
+            except OSError:
+                pass
+            pre_snapshot = _snapshot_claude_sessions(project_dir=project_dir)
+            subprocess.run([claude_bin])
+    else:
+        subprocess.run([claude_bin])
 
     # Store session ID so next run resumes this exact session.
-    # No retries needed here — subprocess.run blocks until the user exits, so
-    # the JSONL definitely exists by the time we reach this line.
+    # No retries needed — subprocess.run blocked until the user exited.
     _store_session_id(wizard_dir, pre_snapshot, project_dir=project_dir, retries=1)
 
 
