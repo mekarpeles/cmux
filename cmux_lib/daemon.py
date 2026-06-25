@@ -17,11 +17,16 @@ STATE_DIR = os.environ.get('CMUX_STATE_DIR', os.path.expanduser('~/.cmux'))
 # Patterns that indicate a Claude Code permission/security prompt is on screen.
 # Used by both the daemon's unblock watcher and by `cmux check`.
 _PERM_PATTERNS = [
+    # Tool-use permission prompts
     'yes, proceed',
     'always allow',
     'no, and tell claude',
     'needs permission',
     '[y/n]',
+    # Directory-trust prompt (new project / relocated workspace)
+    'do you trust',
+    'trust the files in this folder',
+    'workspace trust',
 ]
 
 

@@ -707,7 +707,7 @@ def cmd_check():
         is_stuck = any(pat in pane_text for pat in _PERM_PATTERNS)
         if is_stuck:
             stuck.append((name, target))
-            print(f'  [STUCK] {name:<16} — permission prompt detected ({target})')
+            print(f'  [STUCK] {name:<16} — blocked, needs interaction ({target})')
         else:
             ok.append(name)
             print(f'  [OK]    {name}')

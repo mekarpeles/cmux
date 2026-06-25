@@ -7,7 +7,12 @@ name = "cmux"
 version = "0.1.0"
 description = "Claude multiplexer — persistent named Claude sessions with a programmable message queue"
 requires-python = ">=3.9"
-dependencies = ["claudio"]
+dependencies = [
+    "claudio @ git+https://github.com/mekarpeles/claudio.git",
+]
 
 [project.scripts]
 cmux = "cmux_lib.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cmux_lib*"]
