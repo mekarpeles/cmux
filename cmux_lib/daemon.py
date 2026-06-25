@@ -113,13 +113,36 @@ def sanitize(text: str) -> str:
     return text.strip()
 
 
-def make_deliver(target: str):
+# Messages longer than this trigger Claude Code's paste-detection heuristic:
+# tmux delivers the full string at once, readline sees a fast burst, and
+# Claude Code shows "[paste N lines]" instead of processing the message.
+# Work-around: write the body to a file and send an @file pointer instead.
+_PASTE_THRESHOLD = 300
+
+
+def make_deliver(name: str, target: str):
+    home = os.path.join(STATE_DIR, name)
+
     def deliver(msg: dict) -> None:
         sender = msg.get('from')
-        label = f'[{sender}@cmux]: ' if sender and sender != 'cmux' else ''
-        text = sanitize(f'{label}{msg["body"]}')
+        label = f'[{sender}@cmux]: ' if sender and sender != 'cmux' else '[cmux]: '
+        body = msg['body']
+
+        if len(label) + len(body) > _PASTE_THRESHOLD:
+            # Write full message to a file; send a short @file pointer that
+            # Claude Code reads cleanly without triggering paste detection.
+            os.makedirs(home, exist_ok=True)
+            ts = int(time.time() * 1000)
+            msg_path = os.path.join(home, f'msg-{ts}.md')
+            with open(msg_path, 'w') as f:
+                f.write(f'{label}{body}')
+            text = sanitize(f'[cmux]: @{msg_path}')
+        else:
+            text = sanitize(f'{label}{body}')
+
         subprocess.run(['tmux', 'send-keys', '-t', target, text])
         subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
+
     return deliver
 
 
@@ -200,7 +223,7 @@ def run(name: str, tmux_target: str = None, no_inject: bool = False, unblock: bo
         deliver = make_deliver_file(name)
         is_idle = lambda: True  # always ready to queue; delivery is non-blocking
     else:
-        deliver = make_deliver(tmux_target)
+        deliver = make_deliver(name, tmux_target)
         is_idle = make_is_idle(tmux_target)
     if unblock:
         t = threading.Thread(target=_unblock_watcher, args=(name, tmux_target), daemon=True)
