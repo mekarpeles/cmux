@@ -95,7 +95,13 @@ def _tmux_target(name, workspace=None):
 
 
 def _cleanup_files(name):
-    for suffix in ('.sock', '.daemon.pid', '.daemon.log'):
+    home = os.path.join(STATE_DIR, name)
+    # socket lives inside the agent homedir (claudio state_dir=home)
+    try:
+        os.unlink(os.path.join(home, f'{name}.sock'))
+    except FileNotFoundError:
+        pass
+    for suffix in ('.daemon.pid', '.daemon.log'):
         try:
             os.unlink(os.path.join(STATE_DIR, f'{name}{suffix}'))
         except FileNotFoundError:
@@ -295,10 +301,11 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     stored_id = None
     if os.path.exists(session_id_path):
         stored_id = open(session_id_path).read().strip() or None
+    env_prefix = f'CMUX_SESSION_NAME={name} CLAUDIO_STATE_DIR={home}'
     if stored_id:
-        claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin} --resume {stored_id}'
+        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}'
     else:
-        claude_cmd = f'CMUX_SESSION_NAME={name} {claude_bin}'
+        claude_cmd = f'{env_prefix} {claude_bin}'
 
     # Scope session detection to the CWD we're launching from — avoids picking up
     # other active Claude sessions as false positives.
@@ -344,7 +351,7 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         'tmux_session': tmux_sess,
         'tmux_window': name,
         'tmux_target': target,
-        'socket': os.path.join(STATE_DIR, f'{name}.sock'),
+        'socket': os.path.join(home, f'{name}.sock'),
         'daemon_pid': daemon_proc.pid,
         'started': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'initial_prompt': initial_prompt,

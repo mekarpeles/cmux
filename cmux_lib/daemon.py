@@ -233,11 +233,13 @@ def run(name: str, tmux_target: str = None, no_inject: bool = False, unblock: bo
     if unblock:
         t = threading.Thread(target=_unblock_watcher, args=(name, tmux_target), daemon=True)
         t.start()
+    home = os.path.join(STATE_DIR, name)
+    os.makedirs(home, exist_ok=True)
     claudio.run(
         name=name,
         deliver=deliver,
         is_idle=is_idle,
-        state_dir=STATE_DIR,
+        state_dir=home,
     )
 
 

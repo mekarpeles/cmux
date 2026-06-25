@@ -91,7 +91,7 @@ class TestCmuxIntegration(_CmuxBase):
 
     def test_start_creates_socket(self):
         self._start('t2')
-        sock = os.path.join(self.state_dir, 't2.sock')
+        sock = os.path.join(self.state_dir, 't2', 't2.sock')
         ready = _wait_socket(sock, timeout=10)
         self.assertTrue(ready, "daemon socket never became ready")
 
@@ -108,7 +108,7 @@ class TestCmuxIntegration(_CmuxBase):
 
     def test_send_queues_message(self):
         self._start('t5')
-        _wait_socket(os.path.join(self.state_dir, 't5.sock'))
+        _wait_socket(os.path.join(self.state_dir, 't5', 't5.sock'))
         r = _cmux('send', 't5', 'hello from test', state_dir=self.state_dir)
         self.assertIn('queued', r.stdout)
 
@@ -118,7 +118,7 @@ class TestCmuxIntegration(_CmuxBase):
 
     def test_stop_removes_registry_entry(self):
         self._start('t6')
-        _wait_socket(os.path.join(self.state_dir, 't6.sock'))
+        _wait_socket(os.path.join(self.state_dir, 't6', 't6.sock'))
         _cmux('stop', 't6', state_dir=self.state_dir)
         self._started.remove('t6')
         reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
@@ -126,7 +126,7 @@ class TestCmuxIntegration(_CmuxBase):
 
     def test_stop_removes_socket(self):
         self._start('t7')
-        sock = os.path.join(self.state_dir, 't7.sock')
+        sock = os.path.join(self.state_dir, 't7', 't7.sock')
         _wait_socket(sock)
         _cmux('stop', 't7', state_dir=self.state_dir)
         self._started.remove('t7')
@@ -136,7 +136,7 @@ class TestCmuxIntegration(_CmuxBase):
     def test_message_delivered_to_pane(self):
         """Message sent via cmux send appears in the fake Claude's tmux pane."""
         self._start('t8')
-        _wait_socket(os.path.join(self.state_dir, 't8.sock'))
+        _wait_socket(os.path.join(self.state_dir, 't8', 't8.sock'))
         _cmux('send', 't8', 'test-payload-xyz', state_dir=self.state_dir)
         # Give the daemon a moment to detect idle and deliver
         time.sleep(2.5)
@@ -157,7 +157,7 @@ class TestCmuxIntegration(_CmuxBase):
     def test_stop_workspace_agent_leaves_others(self):
         self._start('wa', workspace='ws2')
         self._start('wb', workspace='ws2')
-        _wait_socket(os.path.join(self.state_dir, 'wa.sock'))
+        _wait_socket(os.path.join(self.state_dir, 'wa', 'wa.sock'))
         _cmux('stop', 'wa', state_dir=self.state_dir)
         self._started.remove('wa')
         # wb's window should still exist
@@ -170,7 +170,7 @@ class TestCmuxIntegration(_CmuxBase):
         # Register so cmd_start upserts to DB
         _cmux('agent', 'register', 'tdb', '--role', 'TestRole', state_dir=self.state_dir)
         self._start('tdb')
-        sock = os.path.join(self.state_dir, 'tdb.sock')
+        sock = os.path.join(self.state_dir, 'tdb', 'tdb.sock')
         _wait_socket(sock)
 
         _cmux('stop', 'tdb', state_dir=self.state_dir)
@@ -264,7 +264,7 @@ class TestCmdCheck(unittest.TestCase):
                 'tmux_session': f'cmux-{name}',
                 'tmux_window': name,
                 'tmux_target': f'cmux-{name}:{name}',
-                'socket': os.path.join(state_dir, f'{name}.sock'),
+                'socket': os.path.join(state_dir, name, f'{name}.sock'),
             }
         return reg
 
@@ -370,7 +370,7 @@ class TestNoInject(_CmuxBase):
         """Messages sent to a --no-inject agent land in inbox.jsonl, not pane."""
         name = f'ni{_rnd()}'
         self._start(name, '--no-inject')
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
 
         payload = f'hello-{_rnd()}'
         _cmux('send', name, payload, state_dir=self.state_dir)
@@ -385,7 +385,7 @@ class TestNoInject(_CmuxBase):
         """cmux inbox prints queued messages and clears the file."""
         name = f'ni{_rnd()}'
         self._start(name, '--no-inject')
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
 
         _cmux('send', name, 'msg-one', state_dir=self.state_dir)
         _cmux('send', name, 'msg-two', state_dir=self.state_dir)
@@ -414,7 +414,7 @@ class TestNoInject(_CmuxBase):
         name = f'ni{_rnd()}'
         payload = f'pane-absence-{_rnd()}'
         self._start(name, '--no-inject')
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
 
         _cmux('send', name, payload, state_dir=self.state_dir)
         time.sleep(1.5)
@@ -438,7 +438,7 @@ class TestDetach(_CmuxBase):
         """cmux detach exits 0 even when no client is attached (no-op)."""
         name = f'det{_rnd()}'
         self._start(name)
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
         r = _cmux('detach', name, state_dir=self.state_dir)
         self.assertEqual(r.returncode, 0)
         self.assertIn('detached', r.stdout)
@@ -451,7 +451,7 @@ class TestDetach(_CmuxBase):
         """After detach, the agent is still in sessions.json."""
         name = f'det{_rnd()}'
         self._start(name)
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
         _cmux('detach', name, state_dir=self.state_dir)
         reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
         self.assertIn(name, reg)
@@ -472,8 +472,8 @@ class TestWorkspaceRestart(_CmuxBase):
 
         self._start(a1, workspace=ws)
         self._start(a2, workspace=ws)
-        _wait_socket(os.path.join(self.state_dir, f'{a1}.sock'))
-        _wait_socket(os.path.join(self.state_dir, f'{a2}.sock'))
+        _wait_socket(os.path.join(self.state_dir, a1, f'{a1}.sock'))
+        _wait_socket(os.path.join(self.state_dir, a2, f'{a2}.sock'))
 
         _cmux('stop', a1, state_dir=self.state_dir)
         _cmux('stop', a2, state_dir=self.state_dir)
@@ -490,8 +490,8 @@ class TestWorkspaceRestart(_CmuxBase):
         subprocess.run([CMUX, '-s', ws], env=env, capture_output=True, check=True)
         self._started += [a1, a2]
 
-        _wait_socket(os.path.join(self.state_dir, f'{a1}.sock'))
-        _wait_socket(os.path.join(self.state_dir, f'{a2}.sock'))
+        _wait_socket(os.path.join(self.state_dir, a1, f'{a1}.sock'))
+        _wait_socket(os.path.join(self.state_dir, a2, f'{a2}.sock'))
 
         reg2 = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
         self.assertIn(a1, reg2)
@@ -514,7 +514,7 @@ class TestImportSessions(_CmuxBase):
                 'tmux_session': 'ol-loop',
                 'tmux_window': 'odie',
                 'tmux_target': 'ol-loop:odie',
-                'socket': os.path.join(self.state_dir, 'odie.sock'),
+                'socket': os.path.join(self.state_dir, 'odie', 'odie.sock'),
                 'daemon_pid': 99999,
                 'started': '2026-01-01T00:00:00Z',
                 'initial_prompt': None,
@@ -682,7 +682,7 @@ class TestUpDownRm(_CmuxBase):
     def test_down_is_alias_for_stop(self):
         name = f'dn{_rnd()}'
         _cmux('up', name, '-d', state_dir=self.state_dir)
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
         _cmux('down', name, state_dir=self.state_dir)
         self._started.remove(name) if name in self._started else None
         reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
@@ -691,7 +691,7 @@ class TestUpDownRm(_CmuxBase):
     def test_rm_deregisters_agent_preserves_home(self):
         name = f'rm{_rnd()}'
         _cmux('up', name, '-d', state_dir=self.state_dir)
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
         _cmux('down', name, state_dir=self.state_dir)
         self._started.remove(name) if name in self._started else None
         home = os.path.join(self.state_dir, name)
@@ -755,7 +755,7 @@ class TestSessionContinuity(_CmuxBase):
         """cmux up after down starts the agent again."""
         name = f'sc{_rnd()}'
         self._start(name)
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
         _cmux('down', name, state_dir=self.state_dir)
         self._started.remove(name) if name in self._started else None
         _cmux('up', name, '-d', state_dir=self.state_dir)
@@ -768,7 +768,7 @@ class TestSessionContinuity(_CmuxBase):
         so last-session-id is not written — _store_session_id is a safe no-op."""
         name = f'sc{_rnd()}'
         self._start(name)
-        _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
         sid_path = os.path.join(self.state_dir, name, 'last-session-id')
         # Either file doesn't exist (no sessions detected) or contains a valid UUID-like string
         if os.path.exists(sid_path):
@@ -862,7 +862,7 @@ class TestSessionContinuity(_CmuxBase):
         try:
             _cmux('agent', 'register', name, '--workflow', wf_file.name, state_dir=self.state_dir)
             self._start(name)
-            _wait_socket(os.path.join(self.state_dir, f'{name}.sock'))
+            _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
             # Verify workflow path is in the DB
             db_path = os.path.join(self.state_dir, 'agents.db')
             conn = sqlite3.connect(db_path)
