@@ -4,7 +4,7 @@ set -e
 # cmux installer — installs tmux (if needed) and cmux via pipx
 # Usage: curl -fsSL https://raw.githubusercontent.com/.../install.sh | bash
 
-REPO="https://github.com/mekarpeles/cmux"
+REPO="git+https://github.com/mekarpeles/cmux.git"
 
 # ── detect OS ─────────────────────────────────────────────────────────────────
 OS="$(uname -s)"
