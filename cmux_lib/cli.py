@@ -250,7 +250,9 @@ def _inject_startup_context(name, home):
     identity_path = os.path.join(home, 'identity.md')
     if not os.path.exists(identity_path):
         onboarding = os.path.join(_PKG_DIR, 'ONBOARDING.md')
+        identity_guide = os.path.join(_PKG_DIR, 'IDENTITY_GUIDE.md')
         cmd_send(name, f'@{onboarding}', sender='cmux')
+        cmd_send(name, f'@{identity_guide}', sender='cmux')
     else:
         wakeup_tpl = os.path.join(_PKG_DIR, 'WAKEUP.md')
         msg = open(wakeup_tpl).read().strip().replace('{name}', name)
@@ -286,12 +288,8 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     home = os.path.join(STATE_DIR, name)
     os.makedirs(home, exist_ok=True)
 
-    # Scaffold identity.md from initial_prompt if neither exists yet.
-    if initial_prompt:
-        identity_path = os.path.join(home, 'identity.md')
-        if not os.path.exists(identity_path):
-            with open(identity_path, 'w') as _f:
-                _f.write(initial_prompt)
+    # initial_prompt is delivered as a message after onboarding, not written
+    # directly to identity.md — the agent creates identity.md themselves.
 
     # Drop MIGRATE.md into home dir if not already present.
     _migrate_src = os.path.join(os.path.dirname(__file__), '..', 'MIGRATE.md')
@@ -380,6 +378,9 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     _wait_for_socket(reg[name]['socket'])
 
     _inject_startup_context(name, home)
+
+    if initial_prompt:
+        cmd_send(name, initial_prompt, sender='cmux')
 
     # Detect and store Claude session ID after message injection — JSONL is created
     # lazily (often after the first exchange), so checking immediately after socket

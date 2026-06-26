@@ -135,6 +135,11 @@ class TestCmuxIntegration(_CmuxBase):
 
     def test_message_delivered_to_pane(self):
         """Message sent via cmux send appears in the fake Claude's tmux pane."""
+        # Pre-create identity.md so onboarding messages are skipped
+        home = os.path.join(self.state_dir, 't8')
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, 'identity.md'), 'w') as f:
+            f.write('test agent')
         self._start('t8')
         _wait_socket(os.path.join(self.state_dir, 't8', 't8.sock'))
         _cmux('send', 't8', 'test-payload-xyz', state_dir=self.state_dir)
@@ -369,6 +374,11 @@ class TestNoInject(_CmuxBase):
     def test_no_inject_writes_to_inbox_file(self):
         """Messages sent to a --no-inject agent land in inbox.jsonl, not pane."""
         name = f'ni{_rnd()}'
+        # Pre-create identity.md so onboarding messages are skipped
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, 'identity.md'), 'w') as f:
+            f.write('test agent')
         self._start(name, '--no-inject')
         _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
 
@@ -728,14 +738,19 @@ _cli_module_for_session._SESSION_DETECT_INTERVAL = 0
 class TestSessionContinuity(_CmuxBase):
     """Tests for home dir scaffolding, session ID tracking, workflow/identity injection."""
 
-    def test_up_writes_identity_from_initial_prompt(self):
-        """cmux up writes initial_prompt to identity.md if identity.md absent."""
+    def test_up_injects_initial_prompt_as_message(self):
+        """cmux up injects initial_prompt as a message; agent creates identity.md themselves."""
         name = f'sc{_rnd()}'
-        _cmux('agent', 'register', name, '--', 'You are a test agent.', state_dir=self.state_dir)
-        self._start(name)
-        identity_path = os.path.join(self.state_dir, name, 'identity.md')
-        self.assertTrue(os.path.exists(identity_path))
-        self.assertIn('test agent', open(identity_path).read())
+        _cmux('agent', 'register', name, '--no-inject', '--', 'You are a test agent.',
+              state_dir=self.state_dir)
+        self._start(name, '--no-inject')
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
+        time.sleep(4.0)  # onboarding (x2) + initial_prompt, each ~1s apart
+        inbox = os.path.join(self.state_dir, f'{name}.inbox.jsonl')
+        self.assertTrue(os.path.exists(inbox), 'inbox should exist')
+        content = open(inbox).read()
+        self.assertIn('You are a test agent', content,
+                      'initial_prompt should appear as an injected message')
 
     def test_up_does_not_overwrite_existing_identity(self):
         """Existing identity.md is never overwritten by initial_prompt."""
@@ -855,17 +870,17 @@ class TestSessionContinuity(_CmuxBase):
             shutil.rmtree(home, ignore_errors=True)
 
     def test_startup_context_onboarding_when_no_identity(self):
-        """_inject_startup_context sends @ONBOARDING.md when identity.md is absent."""
+        """_inject_startup_context sends @ONBOARDING.md + @IDENTITY_GUIDE.md when identity.md is absent."""
         from unittest.mock import patch as _patch
         home = tempfile.mkdtemp(prefix='cmux-id-test-')
         name = os.path.basename(home)
         try:
             with _patch('cmux_lib.cli.cmd_send') as mock_send:
                 _cli_module_for_session._inject_startup_context(name, home)
-            mock_send.assert_called_once()
-            sent_msg = mock_send.call_args[0][1]
-            self.assertIn('@', sent_msg)
-            self.assertIn('ONBOARDING.md', sent_msg)
+            self.assertEqual(mock_send.call_count, 2)
+            msgs = [call[0][1] for call in mock_send.call_args_list]
+            self.assertTrue(any('ONBOARDING.md' in m for m in msgs))
+            self.assertTrue(any('IDENTITY_GUIDE.md' in m for m in msgs))
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
