@@ -971,6 +971,11 @@ def cmd_upgrade():
         env['UV_VENV_CLEAR'] = '1'  # uv-backed pipx refuses to overwrite existing venv without this
         r2 = subprocess.run(['pipx', 'install', '--force', os.path.join(tmp, 'cmux')], env=env)
         if r2.returncode != 0:
+            print(
+                'cmux: upgrade failed. If pipx uses uv and the venv already exists, run:\n'
+                '  UV_VENV_CLEAR=1 pipx install --force git+https://github.com/mekarpeles/cmux.git',
+                file=sys.stderr,
+            )
             sys.exit(r2.returncode)
         print('cmux: upgrade complete.')
     finally:
