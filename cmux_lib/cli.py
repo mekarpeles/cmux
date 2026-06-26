@@ -377,7 +377,6 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         f'You are a cmux agent named "{name}". '
         f'Your home directory is {home} — your personal context, notes, and issue queue live there. '
         f'Your issue queue: run `cq issue list` (auto-resolves to your home dir). '
-        f'Read {os.path.join(home, "MIGRATE.md")} to migrate your context into your home dir. '
         f'Wait for instructions before doing anything — do not introduce yourself, '
         f'send messages, or take any action until you receive a task. '
         f'Messages from other agents arrive automatically as: [sender@cmux]: <message>. '
