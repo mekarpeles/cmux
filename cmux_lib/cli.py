@@ -967,7 +967,9 @@ def cmd_upgrade():
             print(f'cmux: clone failed — {r.stderr.strip()}', file=sys.stderr)
             sys.exit(1)
         print('cmux: upgrading...')
-        r2 = subprocess.run(['pipx', 'install', '--force', os.path.join(tmp, 'cmux')])
+        env = os.environ.copy()
+        env['UV_VENV_CLEAR'] = '1'  # uv-backed pipx refuses to overwrite existing venv without this
+        r2 = subprocess.run(['pipx', 'install', '--force', os.path.join(tmp, 'cmux')], env=env)
         if r2.returncode != 0:
             sys.exit(r2.returncode)
         print('cmux: upgrade complete.')
