@@ -71,7 +71,10 @@ fi
 
 # ── cmux ──────────────────────────────────────────────────────────────────────
 echo "cmux: installing cmux..."
-pipx install "$REPO"
+CMUX_TMP="$(mktemp -d)"
+git clone --depth=1 "https://github.com/mekarpeles/cmux.git" "$CMUX_TMP/cmux"
+pipx install "$CMUX_TMP/cmux"
+rm -rf "$CMUX_TMP"
 
 echo ""
 echo "cmux installed. You may need to restart your shell or run:"
