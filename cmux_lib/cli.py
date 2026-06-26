@@ -747,6 +747,11 @@ def cmd_rm(name):
         sys.exit(1)
     db.remove_agent(name)
     home = os.path.join(STATE_DIR, name)
+    # Clear resume pointer — next start should be a fresh session.
+    try:
+        os.unlink(os.path.join(home, 'last-session-id'))
+    except FileNotFoundError:
+        pass
     print(f"cmux: '{name}' de-registered")
     if os.path.isdir(home):
         print(f"         home dir preserved: {home}")
