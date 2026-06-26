@@ -1101,13 +1101,30 @@ def main():
     elif cmd == 'down':
         cmd = 'stop'
 
-    # Shorthand: `cmux [-s ws] <name>` → up + attach
+    # Shorthand: `cmux [-s ws] <name> [flags] [-- "prompt"]` → up + attach
     if cmd not in ('start', 'ls', 'send', 'attach', 'detach', 'stop', 'inbox'):
         if cmd.startswith('-'):
             print(f'cmux: unknown option {cmd!r}', file=sys.stderr)
             print(USAGE)
             sys.exit(1)
-        cmd_start(cmd, detach=False, workspace=workspace)
+        detach = '-d' in args or '--detach' in args
+        no_inject = '--no-inject' in args
+        unblock = '--unblock' in args
+        flag_args = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject', '--unblock')]
+        flag_args = ['--identity' if a == '-i' else a for a in flag_args]
+        _, sh_flags = _parse_flags(flag_args, kv=('allowed-tools', 'identity'))
+        kv_vals = {sh_flags.get('allowed-tools'), sh_flags.get('identity')} - {None}
+        remaining = [a for a in flag_args
+                     if a not in ('--allowed-tools', '--identity') and a not in kv_vals]
+        try:
+            sep = remaining.index('--')
+            initial_prompt = ' '.join(remaining[sep + 1:]) or None
+        except ValueError:
+            initial_prompt = None
+        cmd_start(cmd, initial_prompt=initial_prompt, detach=detach, workspace=workspace,
+                  no_inject=no_inject, unblock=unblock,
+                  allowed_tools=sh_flags.get('allowed-tools'),
+                  identity_path=sh_flags.get('identity'))
         return
 
     if cmd == 'start':
