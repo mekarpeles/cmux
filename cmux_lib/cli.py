@@ -1217,7 +1217,8 @@ def main():
     elif cmd == 'down':
         cmd = 'stop'
 
-    # Shorthand: `cmux [-s ws] <name> [flags] [-- "prompt"]` → up + attach
+    # Shorthand: `cmux <name> [-s ws] [flags] [-- "prompt"]` → up + attach
+    # -s may appear before OR after the name; same for -i/--identity.
     if cmd not in ('start', 'ls', 'send', 'attach', 'detach', 'stop', 'inbox'):
         if cmd.startswith('-'):
             print(f'cmux: unknown option {cmd!r}', file=sys.stderr)
@@ -1227,17 +1228,21 @@ def main():
         no_inject = '--no-inject' in args
         unblock = '--unblock' in args
         flag_args = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject', '--unblock')]
-        flag_args = ['--identity' if a == '-i' else a for a in flag_args]
-        _, sh_flags = _parse_flags(flag_args, kv=('allowed-tools', 'identity'))
-        kv_vals = {sh_flags.get('allowed-tools'), sh_flags.get('identity')} - {None}
+        # Normalise short flags so _parse_flags can handle them as kv pairs.
+        flag_args = [{'--identity': '--identity', '-i': '--identity',
+                      '--session': '--session', '-s': '--session'}.get(a, a)
+                     for a in flag_args]
+        _, sh_flags = _parse_flags(flag_args, kv=('allowed-tools', 'identity', 'session'))
+        sh_workspace = sh_flags.get('session') or workspace
+        kv_vals = {sh_flags.get('allowed-tools'), sh_flags.get('identity'), sh_flags.get('session')} - {None}
         remaining = [a for a in flag_args
-                     if a not in ('--allowed-tools', '--identity') and a not in kv_vals]
+                     if a not in ('--allowed-tools', '--identity', '--session') and a not in kv_vals]
         try:
             sep = remaining.index('--')
             initial_prompt = ' '.join(remaining[sep + 1:]) or None
         except ValueError:
             initial_prompt = None
-        cmd_start(cmd, initial_prompt=initial_prompt, detach=detach, workspace=workspace,
+        cmd_start(cmd, initial_prompt=initial_prompt, detach=detach, workspace=sh_workspace,
                   no_inject=no_inject, unblock=unblock,
                   allowed_tools=sh_flags.get('allowed-tools'),
                   identity_path=sh_flags.get('identity'))
@@ -1251,18 +1256,21 @@ def main():
         no_inject = '--no-inject' in args
         unblock = '--unblock' in args
         flag_args = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject', '--unblock')]
-        flag_args = ['--identity' if a == '-i' else a for a in flag_args]
-        _, up_flags = _parse_flags(flag_args, kv=('allowed-tools', 'identity'))
-        kv_vals = {up_flags.get('allowed-tools'), up_flags.get('identity')} - {None}
+        flag_args = [{'--identity': '--identity', '-i': '--identity',
+                      '--session': '--session', '-s': '--session'}.get(a, a)
+                     for a in flag_args]
+        _, up_flags = _parse_flags(flag_args, kv=('allowed-tools', 'identity', 'session'))
+        up_workspace = up_flags.get('session') or workspace
+        kv_vals = {up_flags.get('allowed-tools'), up_flags.get('identity'), up_flags.get('session')} - {None}
         remaining = [a for a in flag_args
-                     if a not in ('--allowed-tools', '--identity') and a not in kv_vals]
+                     if a not in ('--allowed-tools', '--identity', '--session') and a not in kv_vals]
         name = remaining[0]
         try:
             sep = remaining.index('--')
             initial_prompt = ' '.join(remaining[sep + 1:]) or None
         except ValueError:
             initial_prompt = None
-        cmd_start(name, initial_prompt=initial_prompt, detach=detach, workspace=workspace,
+        cmd_start(name, initial_prompt=initial_prompt, detach=detach, workspace=up_workspace,
                   no_inject=no_inject, unblock=unblock,
                   allowed_tools=up_flags.get('allowed-tools'),
                   identity_path=up_flags.get('identity'))
