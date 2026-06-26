@@ -39,6 +39,7 @@ def init():
                 initial_prompt  TEXT,
                 no_inject       INTEGER DEFAULT 0,
                 unblock         INTEGER DEFAULT 0,
+                allowed_tools   TEXT,
                 registered_at   TEXT
             );
             CREATE TABLE IF NOT EXISTS tasks (
@@ -52,31 +53,38 @@ def init():
                 updated_at  TEXT NOT NULL
             );
         """)
-        # Migration: add unblock column to existing DBs that predate it.
-        try:
-            c.execute('ALTER TABLE agents ADD COLUMN unblock INTEGER DEFAULT 0')
-        except Exception:
-            pass  # column already exists
+        # Migrations: add columns to existing DBs that predate them.
+        for col_sql in (
+            'ALTER TABLE agents ADD COLUMN unblock INTEGER DEFAULT 0',
+            'ALTER TABLE agents ADD COLUMN allowed_tools TEXT',
+        ):
+            try:
+                c.execute(col_sql)
+            except Exception:
+                pass  # column already exists
 
 
 def register_agent(name, role=None, workspace=None, workflow_path=None,
-                   initial_prompt=None, no_inject=False, unblock=False):
+                   initial_prompt=None, no_inject=False, unblock=False,
+                   allowed_tools=None):
     """Register or update an agent (upsert on name)."""
     init()
     ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     with _conn() as c:
         c.execute("""
             INSERT INTO agents
-                (name, role, workspace, workflow_path, initial_prompt, no_inject, unblock, registered_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (name, role, workspace, workflow_path, initial_prompt, no_inject, unblock, allowed_tools, registered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 role=excluded.role,
                 workspace=excluded.workspace,
                 workflow_path=excluded.workflow_path,
                 initial_prompt=excluded.initial_prompt,
                 no_inject=excluded.no_inject,
-                unblock=excluded.unblock
-        """, (name, role, workspace, workflow_path, initial_prompt, int(no_inject), int(unblock), ts))
+                unblock=excluded.unblock,
+                allowed_tools=excluded.allowed_tools
+        """, (name, role, workspace, workflow_path, initial_prompt,
+               int(no_inject), int(unblock), allowed_tools, ts))
 
 
 def get_agent(name):

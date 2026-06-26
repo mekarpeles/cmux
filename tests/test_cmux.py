@@ -1052,5 +1052,87 @@ class TestUnblockIntegration(_CmuxBase):
         self.assertEqual(row[1], 1, 'unblock column should be 1')
 
 
+# ------------------------------------------------------------------
+# Tests for --allowed-tools flag
+# ------------------------------------------------------------------
+
+class TestAllowedTools(_CmuxBase):
+
+    def test_agent_register_allowed_tools_persists_in_db(self):
+        """cmux agent register --allowed-tools stores the value in agents.db."""
+        name = f'at{_rnd()}'
+        tools = 'Bash,Read,Edit,Write'
+        _cmux('agent', 'register', name, '--allowed-tools', tools, state_dir=self.state_dir)
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT name, allowed_tools FROM agents WHERE name = ?', (name,)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1], tools)
+
+    def test_allowed_tools_flag_in_claude_cmd(self):
+        """cmd_start with allowed_tools passes --allowedTools to the tmux claude invocation."""
+        from unittest.mock import patch as _patch, MagicMock
+        import cmux_lib.cli as _cli
+
+        name = f'at{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        # Pre-create identity.md to skip onboarding injection
+        with open(os.path.join(home, 'identity.md'), 'w') as f:
+            f.write('test')
+
+        tmux_calls = []
+
+        def fake_run(args, **kwargs):
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = '\n'.join([name]) + '\n'
+            tmux_calls.append(list(args))
+            return r
+
+        def fake_popen(args, **kwargs):
+            tmux_calls.append(list(args))
+            m = MagicMock()
+            m.pid = 99999
+            return m
+
+        orig_state = _cli.STATE_DIR
+        _cli.STATE_DIR = self.state_dir
+        try:
+            with _patch('cmux_lib.cli.subprocess.run', side_effect=fake_run), \
+                 _patch('cmux_lib.cli.subprocess.Popen', side_effect=fake_popen), \
+                 _patch('cmux_lib.cli._wait_for_socket'), \
+                 _patch('cmux_lib.cli._inject_startup_context'), \
+                 _patch('cmux_lib.cli._store_session_id'), \
+                 _patch('cmux_lib.cli.cmd_attach'), \
+                 _patch('cmux_lib.cli.save_registry'), \
+                 _patch('cmux_lib.cli.load_registry', return_value={}):
+                _cli.cmd_start(name, detach=True, allowed_tools='Bash,Read',
+                               workspace=None, no_inject=False)
+        finally:
+            _cli.STATE_DIR = orig_state
+
+        # The tmux new-session or new-window call embeds the full claude_cmd string
+        new_sess_calls = [c for c in tmux_calls if 'new-session' in c or 'new-window' in c]
+        self.assertTrue(new_sess_calls, 'expected a tmux new-session or new-window call')
+        claude_cmd_arg = ' '.join(new_sess_calls[0])
+        self.assertIn('--allowedTools', claude_cmd_arg)
+        self.assertIn('Bash,Read', claude_cmd_arg)
+
+    def test_allowed_tools_inherited_from_db_on_restart(self):
+        """Registered allowed_tools are picked up on cmux up without re-specifying the flag."""
+        name = f'at{_rnd()}'
+        tools = 'Bash,Read,Write'
+        _cmux('agent', 'register', name, '--allowed-tools', tools, state_dir=self.state_dir)
+
+        # Verify DB entry
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT allowed_tools FROM agents WHERE name = ?', (name,)).fetchone()
+        conn.close()
+        self.assertEqual(row[0], tools)
+
+
 if __name__ == '__main__':
     unittest.main()
