@@ -698,7 +698,7 @@ class TestUpDownRm(_CmuxBase):
         reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
         self.assertNotIn(name, reg)
 
-    def test_rm_deregisters_agent_preserves_home(self):
+    def test_rm_archives_home(self):
         name = f'rm{_rnd()}'
         _cmux('up', name, '-d', state_dir=self.state_dir)
         _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
@@ -708,15 +708,19 @@ class TestUpDownRm(_CmuxBase):
         self.assertTrue(os.path.isdir(home))
 
         r = _cmux('rm', name, state_dir=self.state_dir)
-        # Home dir must survive — it has provenance (cq, logs, scripts)
-        self.assertTrue(os.path.isdir(home), 'home dir should be preserved after rm')
+        # Original home dir must be gone (moved to archive)
+        self.assertFalse(os.path.isdir(home), 'home dir should be moved to archive on rm')
+        # Archive dir must contain an entry for this agent
+        archive_dir = os.path.join(self.state_dir, 'archive')
+        archived = [d for d in os.listdir(archive_dir) if d.endswith(f'_{name}')]
+        self.assertTrue(archived, 'archived entry should exist under archive/')
         # DB entry must be gone
         db_path = os.path.join(self.state_dir, 'agents.db')
         conn = sqlite3.connect(db_path)
         row = conn.execute('SELECT name FROM agents WHERE name = ?', (name,)).fetchone()
         conn.close()
         self.assertIsNone(row, 'agent should be de-registered from agents.db after rm')
-        self.assertIn('preserved', r.stdout)
+        self.assertIn('archived', r.stdout)
 
     def test_rm_refuses_running_agent(self):
         name = f'rm{_rnd()}'

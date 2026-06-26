@@ -363,9 +363,9 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     env_prefix = f'CMUX_SESSION_NAME={name} CLAUDIO_STATE_DIR={home}'
     allowed_tools_flag = f' --allowedTools {allowed_tools}' if allowed_tools else ''
     if stored_id:
-        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}{allowed_tools_flag}'
+        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}{allowed_tools_flag} --dangerouslySkipPermissions'
     else:
-        claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag}'
+        claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag} --dangerouslySkipPermissions'
 
     # Scope session detection to the CWD we're launching from — avoids picking up
     # other active Claude sessions as false positives.
@@ -733,13 +733,15 @@ def cmd_agent_rm(name):
         print(f"         note: '{name}' is still running — stop with: cmux stop {name}")
 
 
-def cmd_rm(name):
-    """De-register an agent: removes from agents.db only. Agent must be down first.
+def cmd_rm(name, force=False):
+    """De-register an agent. Agent must be down first.
 
-    The home directory (~/.cmux/{name}/) is intentionally preserved — it contains
-    cq history, scripts, and logs that have provenance value. Remove it manually
-    if you need to reclaim the space.
+    By default, the home directory is moved to ~/.cmux/archive/<epoch>_<name>/
+    so conversation history and cq data are preserved but the agent won't resume.
+
+    Pass force=True (cmux rm -f <name>) to hard-delete the home dir entirely.
     """
+    import shutil as _shutil
     reg = load_registry()
     if name in reg and session_alive(reg[name]):
         print(f"cmux: '{name}' is still running — bring it down first: cmux down {name}",
@@ -747,14 +749,18 @@ def cmd_rm(name):
         sys.exit(1)
     db.remove_agent(name)
     home = os.path.join(STATE_DIR, name)
-    # Clear resume pointer — next start should be a fresh session.
-    try:
-        os.unlink(os.path.join(home, 'last-session-id'))
-    except FileNotFoundError:
-        pass
-    print(f"cmux: '{name}' de-registered")
     if os.path.isdir(home):
-        print(f"         home dir preserved: {home}")
+        if force:
+            _shutil.rmtree(home)
+            print(f"cmux: '{name}' removed (home deleted)")
+        else:
+            archive_dir = os.path.join(STATE_DIR, 'archive')
+            os.makedirs(archive_dir, exist_ok=True)
+            dest = os.path.join(archive_dir, f'{int(time.time())}_{name}')
+            _shutil.move(home, dest)
+            print(f"cmux: '{name}' archived → {dest}")
+    else:
+        print(f"cmux: '{name}' de-registered")
 
 
 def cmd_agent_import_sessions():
@@ -1074,10 +1080,13 @@ def main():
 
     # `rm` is top-level, not under `agent`
     if cmd == 'rm':
-        if len(args) < 2:
+        rm_args = args[1:]
+        force = '-f' in rm_args or '--force' in rm_args
+        names = [a for a in rm_args if not a.startswith('-')]
+        if not names:
             print('cmux: rm requires an agent name', file=sys.stderr)
             sys.exit(1)
-        cmd_rm(args[1])
+        cmd_rm(names[0], force=force)
         return
 
     # ------------------------------------------------------------------
