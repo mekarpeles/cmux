@@ -836,19 +836,36 @@ class TestSessionContinuity(_CmuxBase):
         finally:
             shutil.rmtree(projects, ignore_errors=True)
 
-    def test_identity_injects_at_reference(self):
-        """_inject_identity sends a @ file reference — never reads or inlines content."""
+    def test_startup_context_wakeup_when_identity_exists(self):
+        """_inject_startup_context sends a one-line wakeup when identity.md exists."""
         from unittest.mock import patch as _patch
         home = tempfile.mkdtemp(prefix='cmux-id-test-')
+        name = os.path.basename(home)
         identity_path = os.path.join(home, 'identity.md')
         try:
             with open(identity_path, 'w') as f:
-                f.write('x' * 5000)  # any size — no limit with @ reference
+                f.write('I am an agent.')
             with _patch('cmux_lib.cli.cmd_send') as mock_send:
-                _cli_module_for_session._inject_identity(home)
+                _cli_module_for_session._inject_startup_context(name, home)
             mock_send.assert_called_once()
             sent_msg = mock_send.call_args[0][1]
-            self.assertIn(f'@{identity_path}', sent_msg)
+            self.assertIn(name, sent_msg)
+            self.assertIn('Resuming', sent_msg)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_startup_context_onboarding_when_no_identity(self):
+        """_inject_startup_context sends @ONBOARDING.md when identity.md is absent."""
+        from unittest.mock import patch as _patch
+        home = tempfile.mkdtemp(prefix='cmux-id-test-')
+        name = os.path.basename(home)
+        try:
+            with _patch('cmux_lib.cli.cmd_send') as mock_send:
+                _cli_module_for_session._inject_startup_context(name, home)
+            mock_send.assert_called_once()
+            sent_msg = mock_send.call_args[0][1]
+            self.assertIn('@', sent_msg)
+            self.assertIn('ONBOARDING.md', sent_msg)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -960,7 +977,8 @@ class TestEphemeralRun(unittest.TestCase):
         with _patch('subprocess.run', side_effect=fake_run), _patch('os.chdir'):
             _cli_module_for_session.cmd_wizard()
 
-        boot_calls = [c for c in calls if '-p' in c]
+        claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
+        boot_calls = [c for c in calls if c and c[0] == claude_bin and '-p' in c]
         resume_calls = [c for c in calls if '--resume' in c]
         self.assertTrue(boot_calls, 'expected a -p boot call')
         self.assertIn('--output-format', boot_calls[0])

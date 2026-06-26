@@ -242,13 +242,19 @@ def _store_session_id(home, pre_snapshot, project_dir=None, retries=None, retry_
             time.sleep(retry_interval)
 
 
-def _inject_identity(home):
-    """Send a @ file reference for identity.md so the agent orients themselves."""
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _inject_startup_context(name, home):
+    """Inject onboarding (first start) or a one-line wakeup (subsequent starts)."""
     identity_path = os.path.join(home, 'identity.md')
     if not os.path.exists(identity_path):
-        return
-    name = os.path.basename(home)
-    cmd_send(name, f'[cmux]: @{identity_path}', sender='cmux')
+        onboarding = os.path.join(_PKG_DIR, '..', 'ONBOARDING.md')
+        cmd_send(name, f'@{os.path.normpath(onboarding)}', sender='cmux')
+    else:
+        wakeup_tpl = os.path.join(_PKG_DIR, '..', 'WAKEUP.md')
+        msg = open(os.path.normpath(wakeup_tpl)).read().strip().replace('{name}', name)
+        cmd_send(name, msg, sender='cmux')
 
 
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False, unblock=False):
@@ -373,22 +379,7 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
 
     _wait_for_socket(reg[name]['socket'])
 
-    cmux_info = (
-        f'You are a cmux agent named "{name}". '
-        f'Your home directory is {home} — your personal context, notes, and issue queue live there. '
-        f'Your issue queue: run `cq issue list` (auto-resolves to your home dir). '
-        f'Wait for instructions before doing anything — do not introduce yourself, '
-        f'send messages, or take any action until you receive a task. '
-        f'Messages from other agents arrive automatically as: [sender@cmux]: <message>. '
-        f'To message another agent: cmux send <agent-name> "<message>". '
-        f'Your name ("{name}") is set in your environment — do NOT pass --from. '
-        f'To see all running agents: cmux ls.'
-    )
-    cmd_send(name, cmux_info, sender='cmux')
-
-    # Inject identity.md — gives the agent their role context on every startup
-    # without relying solely on session history (which may be compacted).
-    _inject_identity(home)
+    _inject_startup_context(name, home)
 
     # Detect and store Claude session ID after message injection — JSONL is created
     # lazily (often after the first exchange), so checking immediately after socket
