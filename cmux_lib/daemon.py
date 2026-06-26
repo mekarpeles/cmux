@@ -29,11 +29,16 @@ _PERM_PATTERNS = [
     'workspace trust',
 ]
 
-# File-read permission prompts (numbered-list format). These need a different
-# response: send '2' to approve for the session, NOT Escape (which would deny).
-_FILE_READ_PATTERNS = [
+# Numbered-list file permission prompts (create/edit/read). These need '2 Enter'
+# to approve for the session — Escape would deny the operation.
+_NUMBERED_PERM_PATTERNS = [
     'allow reading',
+    'allow all edits',
     'do you want to proceed',
+    'do you want to create',
+    'do you want to edit',
+    'do you want to write',
+    'do you want to delete',
 ]
 
 
@@ -199,7 +204,7 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
         if result.returncode != 0:
             continue
         pane_text = result.stdout.lower()
-        if any(pat in pane_text for pat in _FILE_READ_PATTERNS):
+        if any(pat in pane_text for pat in _NUMBERED_PERM_PATTERNS):
             # Approve file-read for the session (option 2 in the numbered list)
             subprocess.run(['tmux', 'send-keys', '-t', target, '2', 'Enter'], capture_output=True)
             time.sleep(1.0)
