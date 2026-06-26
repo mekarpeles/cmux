@@ -208,6 +208,17 @@ def _snapshot_claude_sessions(project_dir=None):
     return snapshot
 
 
+def _claude_session_exists(session_id):
+    """Return True if the Claude JSONL for session_id exists anywhere under ~/.claude/projects/."""
+    projects_root = os.path.expanduser('~/.claude/projects')
+    if not os.path.isdir(projects_root):
+        return False
+    for d in os.listdir(projects_root):
+        if os.path.exists(os.path.join(projects_root, d, f'{session_id}.jsonl')):
+            return True
+    return False
+
+
 def _store_session_id(home, pre_snapshot, project_dir=None, retries=None, retry_interval=None):
     """Detect and store the Claude session UUID for this agent.
 
@@ -393,6 +404,15 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     stored_id = None
     if os.path.exists(session_id_path):
         stored_id = open(session_id_path).read().strip() or None
+    # Validate: if the JSONL no longer exists on disk, the session was pruned.
+    # Resuming a missing session causes claude to exit immediately, closing the
+    # tmux window before we can attach.  Clear it and start fresh instead.
+    if stored_id and not _claude_session_exists(stored_id):
+        stored_id = None
+        try:
+            os.unlink(session_id_path)
+        except FileNotFoundError:
+            pass
     env_prefix = f'CMUX_SESSION_NAME={name} CLAUDIO_STATE_DIR={home}'
     allowed_tools_flag = f' --allowedTools {allowed_tools}' if allowed_tools else ''
     if stored_id:

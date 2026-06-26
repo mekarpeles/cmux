@@ -863,6 +863,50 @@ class TestSessionContinuity(_CmuxBase):
         finally:
             shutil.rmtree(projects, ignore_errors=True)
 
+    def test_claude_session_exists_true_when_jsonl_present(self):
+        """_claude_session_exists returns True when the JSONL file exists anywhere."""
+        import tempfile as _tf, uuid as _uuid
+        projects = _tf.mkdtemp(prefix='cmux-proj-')
+        proj_dir = os.path.join(projects, 'some-project')
+        os.makedirs(proj_dir)
+        sid = str(_uuid.uuid4())
+        open(os.path.join(proj_dir, f'{sid}.jsonl'), 'w').close()
+        orig = _cli_module_for_session._claude_session_exists
+        # Patch to use our temp dir
+        def _patched(session_id):
+            for d in os.listdir(projects):
+                if os.path.exists(os.path.join(projects, d, f'{session_id}.jsonl')):
+                    return True
+            return False
+        _cli_module_for_session._claude_session_exists = _patched
+        try:
+            self.assertTrue(_patched(sid))
+            self.assertFalse(_patched(str(_uuid.uuid4())))
+        finally:
+            _cli_module_for_session._claude_session_exists = orig
+            shutil.rmtree(projects, ignore_errors=True)
+
+    def test_stale_session_id_cleared_on_start(self):
+        """A last-session-id that no longer has a JSONL on disk is cleared before start.
+        Prevents claude from receiving --resume <missing-id> and exiting immediately."""
+        import uuid as _uuid
+        from unittest.mock import patch as _patch
+        name = f'stale{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home)
+        stale_id = str(_uuid.uuid4())
+        with open(os.path.join(home, 'last-session-id'), 'w') as f:
+            f.write(stale_id)
+        # Patch _claude_session_exists to return False (session gone)
+        with _patch('cmux_lib.cli._claude_session_exists', return_value=False):
+            self._start(name, '-d')
+            _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
+        # last-session-id should be cleared
+        sid_path = os.path.join(self.state_dir, name, 'last-session-id')
+        if os.path.exists(sid_path):
+            self.assertNotEqual(open(sid_path).read().strip(), stale_id,
+                                'stale last-session-id should have been cleared')
+
     def test_startup_context_wakeup_when_identity_exists(self):
         """_inject_startup_context sends a one-line wakeup when identity.md exists."""
         from unittest.mock import patch as _patch
