@@ -295,7 +295,7 @@ def _inject_startup_context(name, home):
 
 
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False,
-              unblock=False, allowed_tools=None):
+              unblock=False, allowed_tools=None, identity_path=None):
     """Start a new cmux session (window). Uses DB registration if available."""
     # Fall back to DB registration for any unspecified args
     reg_info = db.get_agent(name)
@@ -310,6 +310,8 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
             unblock = bool(reg_info['unblock'])
         if allowed_tools is None and reg_info.get('allowed_tools'):
             allowed_tools = reg_info['allowed_tools']
+        if identity_path is None and reg_info.get('identity_path'):
+            identity_path = reg_info['identity_path']
 
     reg = load_registry()
 
@@ -325,6 +327,19 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     os.makedirs(STATE_DIR, exist_ok=True)
     home = os.path.join(STATE_DIR, name)
     os.makedirs(home, exist_ok=True)
+
+    # Seed identity.md from --identity path on first start (never overwrites).
+    if identity_path:
+        identity_dst = os.path.join(home, 'identity.md')
+        if not os.path.exists(identity_dst):
+            import shutil as _shutil
+            identity_path = os.path.expanduser(identity_path)
+            if not os.path.exists(identity_path):
+                print(f'cmux: identity file not found: {identity_path}', file=sys.stderr)
+                sys.exit(1)
+            _shutil.copy2(identity_path, identity_dst)
+        # If identity.md already exists, the provided path is silently ignored —
+        # the agent owns their identity after the first start.
 
     # Write initial_prompt to a file so it can be @-referenced regardless of length.
     if initial_prompt:
@@ -415,6 +430,7 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         no_inject=no_inject,
         unblock=unblock,
         allowed_tools=allowed_tools,
+        identity_path=identity_path,
     )
 
     _wait_for_socket(reg[name]['socket'])
@@ -524,6 +540,7 @@ def cmd_start_workspace(workspace):
                 no_inject=bool(agent_info.get('no_inject', 0)),
                 unblock=bool(agent_info.get('unblock', 0)),
                 allowed_tools=agent_info.get('allowed_tools'),
+                identity_path=agent_info.get('identity_path'),
             )
             started.append(name)
 
@@ -679,11 +696,11 @@ def cmd_stop(name):
 
 def cmd_agent_register(name, role=None, workspace=None, workflow_path=None,
                        initial_prompt=None, no_inject=False, unblock=False,
-                       allowed_tools=None):
+                       allowed_tools=None, identity_path=None):
     """Register an agent in the persistent catalog."""
     db.register_agent(name, role=role, workspace=workspace, workflow_path=workflow_path,
                       initial_prompt=initial_prompt, no_inject=no_inject, unblock=unblock,
-                      allowed_tools=allowed_tools)
+                      allowed_tools=allowed_tools, identity_path=identity_path)
     print(f"cmux: registered '{name}'")
     if workspace:
         print(f"         workspace:     {workspace}")
@@ -693,6 +710,8 @@ def cmd_agent_register(name, role=None, workspace=None, workflow_path=None,
         print(f"         workflow:      {workflow_path}")
     if allowed_tools:
         print(f"         allowed_tools: {allowed_tools}")
+    if identity_path:
+        print(f"         identity:      {identity_path}")
 
 
 def cmd_agent_list():
@@ -893,7 +912,7 @@ Usage:
   cmux --wizard                             Interactive onboarding guide (start here!)
   cmux run "<system prompt>"                Ephemeral Claude session — no home dir, no history
   cmux [-s workspace] <agent>               Bring agent up and attach (shorthand)
-  cmux [-s workspace] up <agent> [-d] [--no-inject] [--unblock] [--allowed-tools <tools>] [-- "initial prompt"]
+  cmux [-s workspace] up <agent> [-d] [--no-inject] [--unblock] [--allowed-tools <tools>] [-i <path>] [-- "initial prompt"]
   cmux clone <source> <new-name> [-d] [--workspace <ws>] [--allowed-tools <tools>]
   cmux [-s workspace] down <agent>          Take agent offline (home dir preserved)
   cmux rm <agent>                           De-register agent from DB; home dir preserved (must be down first)
@@ -910,7 +929,7 @@ Usage:
   First start launches fresh; subsequent starts resume via --resume <session-id>.
 
 Agent registry (persistent catalog):
-  cmux agent register <name> [--role <r>] [--workspace <ws>] [--workflow <path>] [--no-inject] [--unblock] [--allowed-tools <tools>] [-- "prompt"]
+  cmux agent register <name> [--role <r>] [--workspace <ws>] [--workflow <path>] [--no-inject] [--unblock] [--allowed-tools <tools>] [-i <identity-path>] [-- "prompt"]
   cmux agent list                           Show all registered agents (running + stopped)
   cmux agent import-sessions                Bootstrap registry from current sessions.json
 
@@ -1006,14 +1025,15 @@ def main():
         elif sub == 'import-sessions':
             cmd_agent_import_sessions()
         elif sub == 'register':
-            # cmux agent register <name> [--role r] [--workspace ws] [--workflow p] [--no-inject] [--allowed-tools t] [-- "prompt"]
+            # cmux agent register <name> [--role r] [--workspace ws] [--workflow p] [--no-inject] [--allowed-tools t] [--identity p] [-- "prompt"]
             remaining = args[2:]
             if not remaining or remaining[0].startswith('-'):
                 print('cmux: agent register requires a name', file=sys.stderr)
                 sys.exit(1)
             name = remaining[0]
-            _, flags = _parse_flags(remaining[1:],
-                                    kv=('role', 'workspace', 'workflow', 'allowed-tools'),
+            reg_args = ['--identity' if a == '-i' else a for a in remaining[1:]]
+            _, flags = _parse_flags(reg_args,
+                                    kv=('role', 'workspace', 'workflow', 'allowed-tools', 'identity'),
                                     bools=('no-inject', 'unblock'))
             workspace_val = flags['workspace'] or workspace  # -s flag fallback
             cmd_agent_register(name, role=flags['role'], workspace=workspace_val,
@@ -1021,7 +1041,8 @@ def main():
                                initial_prompt=flags.get('__prompt__'),
                                no_inject=flags['no-inject'],
                                unblock=flags['unblock'],
-                               allowed_tools=flags.get('allowed-tools'))
+                               allowed_tools=flags.get('allowed-tools'),
+                               identity_path=flags.get('identity'))
         else:
             print(f'cmux: unknown agent subcommand {sub!r}', file=sys.stderr)
             print('  subcommands: register, list, rm, import-sessions')
@@ -1090,9 +1111,11 @@ def main():
         no_inject = '--no-inject' in args
         unblock = '--unblock' in args
         flag_args = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject', '--unblock')]
-        _, up_flags = _parse_flags(flag_args, kv=('allowed-tools',))
+        flag_args = ['--identity' if a == '-i' else a for a in flag_args]
+        _, up_flags = _parse_flags(flag_args, kv=('allowed-tools', 'identity'))
+        kv_vals = {up_flags.get('allowed-tools'), up_flags.get('identity')} - {None}
         remaining = [a for a in flag_args
-                     if not a.startswith('--allowed-tools') and a != up_flags.get('allowed-tools')]
+                     if a not in ('--allowed-tools', '--identity') and a not in kv_vals]
         name = remaining[0]
         try:
             sep = remaining.index('--')
@@ -1101,7 +1124,8 @@ def main():
             initial_prompt = None
         cmd_start(name, initial_prompt=initial_prompt, detach=detach, workspace=workspace,
                   no_inject=no_inject, unblock=unblock,
-                  allowed_tools=up_flags.get('allowed-tools'))
+                  allowed_tools=up_flags.get('allowed-tools'),
+                  identity_path=up_flags.get('identity'))
 
     elif cmd == 'ls':
         cmd_ls()

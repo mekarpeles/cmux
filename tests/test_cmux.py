@@ -1281,5 +1281,104 @@ class TestClone(_CmuxBase):
         self.assertEqual(row[0], 'Senior Coordinator')
 
 
+# ------------------------------------------------------------------
+# Tests for --identity flag
+# ------------------------------------------------------------------
+
+class TestIdentityFlag(_CmuxBase):
+
+    def test_identity_flag_seeds_identity_md(self):
+        """cmux up --identity <path> copies the file to the agent's home on first start."""
+        name = f'id{_rnd()}'
+        identity_src = tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False)
+        identity_src.write('Role: Template Coordinator.')
+        identity_src.close()
+        try:
+            _cmux('up', name, '-d', '--identity', identity_src.name, state_dir=self.state_dir)
+            self._started.append(name)
+            identity_dst = os.path.join(self.state_dir, name, 'identity.md')
+            self.assertTrue(os.path.exists(identity_dst))
+            self.assertIn('Template Coordinator', open(identity_dst).read())
+        finally:
+            os.unlink(identity_src.name)
+
+    def test_identity_flag_short_form(self):
+        """cmux up -i <path> is equivalent to --identity."""
+        name = f'id{_rnd()}'
+        identity_src = tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False)
+        identity_src.write('Role: Short Flag Agent.')
+        identity_src.close()
+        try:
+            _cmux('up', name, '-d', '-i', identity_src.name, state_dir=self.state_dir)
+            self._started.append(name)
+            identity_dst = os.path.join(self.state_dir, name, 'identity.md')
+            self.assertTrue(os.path.exists(identity_dst))
+            self.assertIn('Short Flag Agent', open(identity_dst).read())
+        finally:
+            os.unlink(identity_src.name)
+
+    def test_identity_flag_does_not_overwrite_existing(self):
+        """--identity is silently ignored when identity.md already exists."""
+        name = f'id{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, 'identity.md'), 'w') as f:
+            f.write('Existing identity.')
+        identity_src = tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False)
+        identity_src.write('Template should not overwrite.')
+        identity_src.close()
+        try:
+            _cmux('up', name, '-d', '--identity', identity_src.name, state_dir=self.state_dir)
+            self._started.append(name)
+            content = open(os.path.join(home, 'identity.md')).read()
+            self.assertIn('Existing identity', content)
+            self.assertNotIn('should not overwrite', content)
+        finally:
+            os.unlink(identity_src.name)
+
+    def test_identity_flag_missing_file_exits_nonzero(self):
+        """cmux up --identity with a nonexistent path exits nonzero."""
+        name = f'id{_rnd()}'
+        r = _cmux('up', name, '-d', '--identity', '/tmp/does-not-exist-xyz.md',
+                  state_dir=self.state_dir, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('not found', r.stderr)
+
+    def test_agent_register_identity_persists_in_db(self):
+        """cmux agent register --identity stores identity_path in agents.db."""
+        name = f'id{_rnd()}'
+        identity_src = tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False)
+        identity_src.write('Registered identity template.')
+        identity_src.close()
+        try:
+            _cmux('agent', 'register', name, '--identity', identity_src.name,
+                  state_dir=self.state_dir)
+            db_path = os.path.join(self.state_dir, 'agents.db')
+            conn = sqlite3.connect(db_path)
+            row = conn.execute('SELECT identity_path FROM agents WHERE name = ?', (name,)).fetchone()
+            conn.close()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], identity_src.name)
+        finally:
+            os.unlink(identity_src.name)
+
+    def test_identity_from_db_applied_on_up(self):
+        """Registered identity_path is used on cmux up when no identity.md exists yet."""
+        name = f'id{_rnd()}'
+        identity_src = tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False)
+        identity_src.write('DB-registered identity.')
+        identity_src.close()
+        try:
+            _cmux('agent', 'register', name, '--identity', identity_src.name,
+                  state_dir=self.state_dir)
+            _cmux('up', name, '-d', state_dir=self.state_dir)
+            self._started.append(name)
+            identity_dst = os.path.join(self.state_dir, name, 'identity.md')
+            self.assertTrue(os.path.exists(identity_dst))
+            self.assertIn('DB-registered identity', open(identity_dst).read())
+        finally:
+            os.unlink(identity_src.name)
+
+
 if __name__ == '__main__':
     unittest.main()
