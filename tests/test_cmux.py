@@ -1134,5 +1134,152 @@ class TestAllowedTools(_CmuxBase):
         self.assertEqual(row[0], tools)
 
 
+# ------------------------------------------------------------------
+# Tests for cmux clone
+# ------------------------------------------------------------------
+
+class TestClone(_CmuxBase):
+
+    def _make_source(self, name, identity_text='I am the source agent.', role=None):
+        """Create a started agent with identity.md, optionally registered."""
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, 'identity.md'), 'w') as f:
+            f.write(identity_text)
+        if role:
+            _cmux('agent', 'register', name, '--role', role, state_dir=self.state_dir)
+        self._start(name)
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
+        return home
+
+    def test_clone_copies_identity(self):
+        """cmux clone copies source identity.md to new agent's home."""
+        src = f'src{_rnd()}'
+        clone = f'cln{_rnd()}'
+        self._make_source(src, identity_text='Role: original agent.')
+        _cmux('clone', src, clone, '-d', state_dir=self.state_dir)
+        self._started.append(clone)
+        new_identity = os.path.join(self.state_dir, clone, 'identity.md')
+        self.assertTrue(os.path.exists(new_identity))
+        self.assertIn('original agent', open(new_identity).read())
+
+    def test_clone_does_not_copy_cq(self):
+        """cmux clone does not copy the source cq database."""
+        src = f'src{_rnd()}'
+        clone = f'cln{_rnd()}'
+        src_home = self._make_source(src)
+        # Create a fake cq db in source
+        cq_dir = os.path.join(src_home, '.cq')
+        os.makedirs(cq_dir, exist_ok=True)
+        with open(os.path.join(cq_dir, 'issues.db'), 'w') as f:
+            f.write('fake db')
+        _cmux('clone', src, clone, '-d', state_dir=self.state_dir)
+        self._started.append(clone)
+        clone_cq = os.path.join(self.state_dir, clone, '.cq', 'issues.db')
+        self.assertFalse(os.path.exists(clone_cq), 'cq db should not be copied to clone')
+
+    def test_clone_no_session_resume(self):
+        """cmux clone does not carry the source's last-session-id to the new agent."""
+        src = f'src{_rnd()}'
+        clone = f'cln{_rnd()}'
+        src_home = self._make_source(src)
+        with open(os.path.join(src_home, 'last-session-id'), 'w') as f:
+            f.write('fake-session-uuid')
+        _cmux('clone', src, clone, '-d', state_dir=self.state_dir)
+        self._started.append(clone)
+        clone_sid = os.path.join(self.state_dir, clone, 'last-session-id')
+        if os.path.exists(clone_sid):
+            # If file exists it must be a freshly detected session, not the source's
+            self.assertNotEqual(open(clone_sid).read().strip(), 'fake-session-uuid')
+
+    def test_clone_startup_message_references_source(self):
+        """Clone startup message (via _inject_startup_context) names the source agent."""
+        from unittest.mock import patch as _patch
+        src = f'src{_rnd()}'
+        clone = f'cln{_rnd()}'
+        # Set up source home
+        src_home = os.path.join(self.state_dir, src)
+        os.makedirs(src_home, exist_ok=True)
+        with open(os.path.join(src_home, 'identity.md'), 'w') as f:
+            f.write('source identity')
+        # Set up clone home with copied identity + marker
+        clone_home = os.path.join(self.state_dir, clone)
+        os.makedirs(clone_home, exist_ok=True)
+        import shutil
+        shutil.copy2(os.path.join(src_home, 'identity.md'), os.path.join(clone_home, 'identity.md'))
+        with open(os.path.join(clone_home, 'clone-source'), 'w') as f:
+            f.write(src)
+
+        with _patch('cmux_lib.cli.cmd_send') as mock_send:
+            _cli_module_for_session._inject_startup_context(clone, clone_home)
+
+        mock_send.assert_called_once()
+        msg = mock_send.call_args[0][1]
+        self.assertIn(src, msg)
+        self.assertIn('clone_readme.md', msg)
+        self.assertIn('clone', msg.lower())
+
+    def test_clone_marker_deleted_after_startup(self):
+        """clone-source marker is removed after _inject_startup_context sends the message."""
+        from unittest.mock import patch as _patch
+        src = f'src{_rnd()}'
+        clone = f'cln{_rnd()}'
+        src_home = os.path.join(self.state_dir, src)
+        os.makedirs(src_home, exist_ok=True)
+        with open(os.path.join(src_home, 'identity.md'), 'w') as f:
+            f.write('source')
+        clone_home = os.path.join(self.state_dir, clone)
+        os.makedirs(clone_home, exist_ok=True)
+        import shutil
+        shutil.copy2(os.path.join(src_home, 'identity.md'), os.path.join(clone_home, 'identity.md'))
+        with open(os.path.join(clone_home, 'clone-source'), 'w') as f:
+            f.write(src)
+
+        with _patch('cmux_lib.cli.cmd_send'):
+            _cli_module_for_session._inject_startup_context(clone, clone_home)
+
+        self.assertFalse(
+            os.path.exists(os.path.join(clone_home, 'clone-source')),
+            'clone-source marker should be deleted after startup message is sent',
+        )
+
+    def test_clone_no_source_identity_exits_nonzero(self):
+        """cmux clone fails with nonzero exit when source has no identity.md."""
+        src = f'src{_rnd()}'
+        clone = f'cln{_rnd()}'
+        # source home exists but has no identity.md
+        os.makedirs(os.path.join(self.state_dir, src), exist_ok=True)
+        r = _cmux('clone', src, clone, '-d', state_dir=self.state_dir, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('identity.md', r.stderr)
+
+    def test_clone_existing_name_exits_nonzero(self):
+        """cmux clone refuses to overwrite an agent that already has identity.md."""
+        src = f'src{_rnd()}'
+        clone = f'cln{_rnd()}'
+        self._make_source(src)
+        # Pre-create clone identity
+        clone_home = os.path.join(self.state_dir, clone)
+        os.makedirs(clone_home, exist_ok=True)
+        with open(os.path.join(clone_home, 'identity.md'), 'w') as f:
+            f.write('already exists')
+        r = _cmux('clone', src, clone, '-d', state_dir=self.state_dir, check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_clone_inherits_source_role_from_db(self):
+        """Clone agent is registered in DB with source's role when source is registered."""
+        src = f'src{_rnd()}'
+        clone = f'cln{_rnd()}'
+        self._make_source(src, role='Senior Coordinator')
+        _cmux('clone', src, clone, '-d', state_dir=self.state_dir)
+        self._started.append(clone)
+        db_path = os.path.join(self.state_dir, 'agents.db')
+        conn = sqlite3.connect(db_path)
+        row = conn.execute('SELECT role FROM agents WHERE name = ?', (clone,)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 'Senior Coordinator')
+
+
 if __name__ == '__main__':
     unittest.main()

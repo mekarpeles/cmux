@@ -248,17 +248,36 @@ _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 def _inject_startup_context(name, home):
     """Inject exactly one startup message.
 
-    First start (no identity.md): name + home + @initial-prompt.md (if any) + @ONBOARDING + @IDENTITY_GUIDE
-    Subsequent starts: inline wakeup line + @initial-prompt.md (if any)
+    Clone start (clone-source file present):
+        name + home + source info + @clone_readme.md; marker deleted after send.
+    First start (no identity.md):
+        name + home + @initial-prompt.md (if any) + @ONBOARDING + @IDENTITY_GUIDE
+    Subsequent starts:
+        inline wakeup line + @initial-prompt.md (if any)
 
-    initial-prompt.md is written by cmd_start before this call, so checking for
-    the file here is sufficient — no need to pass the prompt as an argument.
+    initial-prompt.md is written by cmd_start before this call.
+    clone-source is written by cmd_clone before calling cmd_start.
     """
     identity_path = os.path.join(home, 'identity.md')
     prompt_path = os.path.join(home, 'initial-prompt.md')
-    has_identity = os.path.exists(identity_path)
+    clone_marker = os.path.join(home, 'clone-source')
     has_prompt = os.path.exists(prompt_path)
 
+    if os.path.exists(clone_marker):
+        source_name = open(clone_marker).read().strip()
+        source_home = os.path.join(os.path.dirname(home), source_name)
+        parts = [
+            f'Session: "{name}" — home: {home}.',
+            f'You are a clone of "{source_name}" (source home: {source_home}).',
+        ]
+        if has_prompt:
+            parts.append(f'@{prompt_path}')
+        parts.append(f'@{os.path.join(_PKG_DIR, "clone_readme.md")}')
+        cmd_send(name, ' '.join(parts), sender='cmux', quiet=True)
+        os.unlink(clone_marker)  # delivered — subsequent wakeups are normal
+        return
+
+    has_identity = os.path.exists(identity_path)
     parts = []
     if not has_identity:
         parts.append(f'Session: "{name}" — home: {home}')
@@ -431,6 +450,52 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         print(f"cmux: agent '{name}' started  (cmux attach {name} to open)")
     else:
         cmd_attach(name)
+
+
+def cmd_clone(source, name, detach=False, workspace=None, no_inject=False,
+              unblock=False, allowed_tools=None):
+    """Clone an existing agent: copy identity.md, start fresh (no session resume)."""
+    import shutil as _shutil
+    source_home = os.path.join(STATE_DIR, source)
+    source_identity = os.path.join(source_home, 'identity.md')
+
+    if not os.path.exists(source_identity):
+        print(
+            f"cmux: source agent '{source}' has no identity.md at {source_home}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    new_home = os.path.join(STATE_DIR, name)
+    if os.path.exists(os.path.join(new_home, 'identity.md')):
+        print(
+            f"cmux: '{name}' already has an identity.md — use 'cmux up {name}' to resume",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    os.makedirs(new_home, exist_ok=True)
+    _shutil.copy2(source_identity, os.path.join(new_home, 'identity.md'))
+
+    # Clone marker: triggers the clone startup message in _inject_startup_context,
+    # then is deleted so subsequent wakeups are treated as normal resumes.
+    with open(os.path.join(new_home, 'clone-source'), 'w') as f:
+        f.write(source)
+
+    # Inherit role from source DB registration if not already registered
+    source_info = db.get_agent(source)
+    if not db.get_agent(name) and source_info:
+        db.register_agent(
+            name,
+            role=source_info.get('role'),
+            workspace=workspace,
+            allowed_tools=allowed_tools or source_info.get('allowed_tools'),
+            no_inject=no_inject,
+            unblock=unblock,
+        )
+
+    cmd_start(name, detach=detach, workspace=workspace, no_inject=no_inject,
+              unblock=unblock, allowed_tools=allowed_tools)
 
 
 def cmd_start_workspace(workspace):
@@ -829,6 +894,7 @@ Usage:
   cmux run "<system prompt>"                Ephemeral Claude session — no home dir, no history
   cmux [-s workspace] <agent>               Bring agent up and attach (shorthand)
   cmux [-s workspace] up <agent> [-d] [--no-inject] [--unblock] [--allowed-tools <tools>] [-- "initial prompt"]
+  cmux clone <source> <new-name> [-d] [--workspace <ws>] [--allowed-tools <tools>]
   cmux [-s workspace] down <agent>          Take agent offline (home dir preserved)
   cmux rm <agent>                           De-register agent from DB; home dir preserved (must be down first)
   cmux [-s workspace]                       Bring up ALL registered agents in workspace
@@ -979,6 +1045,26 @@ def main():
             print('cmux: rm requires an agent name', file=sys.stderr)
             sys.exit(1)
         cmd_rm(args[1])
+        return
+
+    # ------------------------------------------------------------------
+    # Clone
+    # ------------------------------------------------------------------
+    if cmd == 'clone':
+        if len(args) < 3:
+            print('cmux: clone requires a source and a new name', file=sys.stderr)
+            print('  usage: cmux clone <source> <new-name> [-d] [--workspace <ws>]')
+            sys.exit(1)
+        source, new_name = args[1], args[2]
+        rest = args[3:]
+        detach = '-d' in rest or '--detach' in rest
+        no_inject = '--no-inject' in rest
+        unblock = '--unblock' in rest
+        _, clone_flags = _parse_flags(rest, kv=('workspace', 'allowed-tools'))
+        clone_ws = clone_flags.get('workspace') or workspace
+        cmd_clone(source, new_name, detach=detach, workspace=clone_ws,
+                  no_inject=no_inject, unblock=unblock,
+                  allowed_tools=clone_flags.get('allowed-tools'))
         return
 
     # Normalise aliases: up=start, down=stop
