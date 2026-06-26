@@ -22,7 +22,7 @@ Cmux is built on three primitives:
 - **[tmux](https://github.com/tmux/tmux)** — manages the sessions. Each agent runs in a named tmux window, persistent and re-attachable.
 - **cmux** — the CLI that ties it together. Use it to start and manage claudio-wrapped Claude Code agents, and to send messages between them.
 
-Running `cmux start <name>` launches a claudio-wrapped Claude Code session inside tmux, registers it by name, and starts listening for messages.
+Running `cmux <name>` (or `cmux up <name>`) launches a claudio-wrapped Claude Code session inside tmux, registers it by name, and starts listening for messages.
 
 ## Why cmux exists
 
