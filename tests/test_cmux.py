@@ -757,12 +757,12 @@ class TestSessionContinuity(_CmuxBase):
         self.assertTrue(os.path.exists(prompt_file), 'initial-prompt.md should exist in home dir')
         self.assertIn('You are a test agent', open(prompt_file).read())
 
-        # The startup inbox message should @-reference the prompt file
+        # The startup inbox message should include the prompt content inline
         inbox = os.path.join(self.state_dir, f'{name}.inbox.jsonl')
         self.assertTrue(os.path.exists(inbox), 'inbox should exist')
         content = open(inbox).read()
-        self.assertIn('initial-prompt.md', content,
-                      'startup message should reference @initial-prompt.md')
+        self.assertIn('You are a test agent', content,
+                      'startup message should inline the initial prompt content')
 
     def test_up_does_not_overwrite_existing_identity(self):
         """Existing identity.md is never overwritten by initial_prompt."""
@@ -926,7 +926,7 @@ class TestSessionContinuity(_CmuxBase):
             shutil.rmtree(home, ignore_errors=True)
 
     def test_startup_context_onboarding_when_no_identity(self):
-        """_inject_startup_context sends @ONBOARDING.md + @IDENTITY_GUIDE.md when identity.md is absent."""
+        """_inject_startup_context sends one message with session info + @ONBOARDING + @IDENTITY_GUIDE when identity.md is absent."""
         from unittest.mock import patch as _patch
         home = tempfile.mkdtemp(prefix='cmux-id-test-')
         name = os.path.basename(home)
@@ -935,9 +935,9 @@ class TestSessionContinuity(_CmuxBase):
                 _cli_module_for_session._inject_startup_context(name, home)
             self.assertEqual(mock_send.call_count, 1)
             msg = mock_send.call_args[0][1]
+            self.assertIn(name, msg)
             self.assertIn('ONBOARDING.md', msg)
             self.assertIn('IDENTITY_GUIDE.md', msg)
-            self.assertIn(name, msg)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 

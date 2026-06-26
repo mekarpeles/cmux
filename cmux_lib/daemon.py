@@ -31,10 +31,12 @@ _PERM_PATTERNS = [
 
 # Three-option prompts where option 2 is "Yes, allow for session".
 # Send '2' to approve for the whole session.
+# Also includes the --permission-mode bypassPermissions confirmation screen.
 _ALLOW_SESSION_PATTERNS = [
     'allow reading',
     'allow all edits',
     'allow all',
+    'bypass permissions mode',  # --permission-mode bypassPermissions startup confirmation
 ]
 
 # Two-option prompts (1. Yes / 2. No) — bash commands, simple confirmations.
@@ -262,7 +264,10 @@ def run(name: str, tmux_target: str = None, no_inject: bool = False, unblock: bo
     else:
         deliver = make_deliver(name, tmux_target)
         is_idle = make_is_idle(tmux_target)
-    if unblock:
+    if not no_inject:
+        # Always run the unblock watcher — catches bypass permissions confirmation
+        # and other permission prompts that appear during normal operation.
+        # no_inject sessions don't use send-keys so the watcher would be a no-op.
         t = threading.Thread(target=_unblock_watcher, args=(name, tmux_target), daemon=True)
         t.start()
     home = os.path.join(STATE_DIR, name)

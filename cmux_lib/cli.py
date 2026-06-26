@@ -260,19 +260,27 @@ def _inject_startup_context(name, home):
     """Inject exactly one startup message.
 
     Clone start (clone-source file present):
-        name + home + source info + @clone_readme.md; marker deleted after send.
+        name + home + source info + inline initial-prompt (if any) + @clone_readme.md
     First start (no identity.md):
-        name + home + @initial-prompt.md (if any) + @ONBOARDING + @IDENTITY_GUIDE
+        name + home + inline initial-prompt (if any) + @ONBOARDING + @IDENTITY_GUIDE
     Subsequent starts:
-        inline wakeup line + @initial-prompt.md (if any)
+        resume line + inline initial-prompt (if any)
 
+    initial-prompt is inlined (not @file ref) so it's guaranteed delivered in the
+    same injection — no file-reference parsing required for the user's prompt.
     initial-prompt.md is written by cmd_start before this call.
     clone-source is written by cmd_clone before calling cmd_start.
     """
     identity_path = os.path.join(home, 'identity.md')
     prompt_path = os.path.join(home, 'initial-prompt.md')
     clone_marker = os.path.join(home, 'clone-source')
-    has_prompt = os.path.exists(prompt_path)
+
+    prompt_text = None
+    if os.path.exists(prompt_path):
+        try:
+            prompt_text = open(prompt_path).read().strip() or None
+        except OSError:
+            pass
 
     if os.path.exists(clone_marker):
         source_name = open(clone_marker).read().strip()
@@ -281,8 +289,8 @@ def _inject_startup_context(name, home):
             f'Session: "{name}" — home: {home}.',
             f'You are a clone of "{source_name}" (source home: {source_home}).',
         ]
-        if has_prompt:
-            parts.append(f'@{prompt_path}')
+        if prompt_text:
+            parts.append(prompt_text)
         parts.append(f'@{os.path.join(_PKG_DIR, "clone_readme.md")}')
         cmd_send(name, ' '.join(parts), sender='cmux', quiet=True)
         os.unlink(clone_marker)  # delivered — subsequent wakeups are normal
@@ -291,12 +299,12 @@ def _inject_startup_context(name, home):
     has_identity = os.path.exists(identity_path)
     parts = []
     if not has_identity:
-        parts.append(f'Session: "{name}" — home: {home}')
+        parts.append(f'Session: "{name}" — home: {home}.')
     else:
         parts.append(f'Resuming "{name}" (ref: {identity_path}).')
 
-    if has_prompt:
-        parts.append(f'@{prompt_path}')
+    if prompt_text:
+        parts.append(prompt_text)
 
     if not has_identity:
         parts.append(f'@{os.path.join(_PKG_DIR, "ONBOARDING.md")}')
@@ -416,9 +424,9 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     env_prefix = f'CMUX_SESSION_NAME={name} CLAUDIO_STATE_DIR={home}'
     allowed_tools_flag = f' --allowedTools {allowed_tools}' if allowed_tools else ''
     if stored_id:
-        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}{allowed_tools_flag}'
+        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}{allowed_tools_flag} --permission-mode bypassPermissions'
     else:
-        claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag}'
+        claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag} --permission-mode bypassPermissions'
 
     # Scope session detection to the CWD we're launching from — avoids picking up
     # other active Claude sessions as false positives.
@@ -459,6 +467,24 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
             print(f"  (no output captured — window already closed)", file=sys.stderr)
         print(f"  cmd: {claude_cmd}", file=sys.stderr)
         sys.exit(1)
+
+    # Auto-accept the --permission-mode bypassPermissions confirmation screen.
+    # Claude shows "❯ 1. No, exit  2. Yes, I accept" — send '2' + Enter, then
+    # poll until the bypass screen clears before starting the daemon (more reliable
+    # than a fixed sleep).
+    subprocess.run(
+        ['tmux', 'send-keys', '-t', target, '2', 'Enter'],
+        capture_output=True,
+    )
+    _deadline = time.time() + 15
+    while time.time() < _deadline:
+        _r = subprocess.run(
+            ['tmux', 'capture-pane', '-t', target, '-p'],
+            capture_output=True, text=True,
+        )
+        if 'bypass permissions mode' not in _r.stdout.lower():
+            break
+        time.sleep(0.3)
 
     daemon_log = os.path.join(STATE_DIR, f'{name}.daemon.log')
     try:
