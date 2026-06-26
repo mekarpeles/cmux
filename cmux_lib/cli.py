@@ -246,19 +246,33 @@ _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _inject_startup_context(name, home):
-    """Inject onboarding (first start) or a one-line wakeup (subsequent starts)."""
+    """Inject exactly one startup message.
+
+    First start (no identity.md): name + home + @initial-prompt.md (if any) + @ONBOARDING + @IDENTITY_GUIDE
+    Subsequent starts: inline wakeup line + @initial-prompt.md (if any)
+
+    initial-prompt.md is written by cmd_start before this call, so checking for
+    the file here is sufficient — no need to pass the prompt as an argument.
+    """
     identity_path = os.path.join(home, 'identity.md')
-    if not os.path.exists(identity_path):
-        onboarding = os.path.join(_PKG_DIR, 'ONBOARDING.md')
-        identity_guide = os.path.join(_PKG_DIR, 'IDENTITY_GUIDE.md')
-        # Single message: name/home inline so agent never shells out, plus @file refs
-        cmd_send(name,
-                 f'Session: "{name}" — home: {home} @{onboarding} @{identity_guide}',
-                 sender='cmux', quiet=True)
+    prompt_path = os.path.join(home, 'initial-prompt.md')
+    has_identity = os.path.exists(identity_path)
+    has_prompt = os.path.exists(prompt_path)
+
+    parts = []
+    if not has_identity:
+        parts.append(f'Session: "{name}" — home: {home}')
     else:
-        wakeup_tpl = os.path.join(_PKG_DIR, 'WAKEUP.md')
-        msg = open(wakeup_tpl).read().strip().replace('{name}', name)
-        cmd_send(name, msg, sender='cmux', quiet=True)
+        parts.append(f'Resuming "{name}" (ref: {identity_path}).')
+
+    if has_prompt:
+        parts.append(f'@{prompt_path}')
+
+    if not has_identity:
+        parts.append(f'@{os.path.join(_PKG_DIR, "ONBOARDING.md")}')
+        parts.append(f'@{os.path.join(_PKG_DIR, "IDENTITY_GUIDE.md")}')
+
+    cmd_send(name, ' '.join(parts), sender='cmux', quiet=True)
 
 
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False, unblock=False):
@@ -290,8 +304,10 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     home = os.path.join(STATE_DIR, name)
     os.makedirs(home, exist_ok=True)
 
-    # initial_prompt is delivered as a message after onboarding, not written
-    # directly to identity.md — the agent creates identity.md themselves.
+    # Write initial_prompt to a file so it can be @-referenced regardless of length.
+    if initial_prompt:
+        with open(os.path.join(home, 'initial-prompt.md'), 'w') as _f:
+            _f.write(initial_prompt)
 
     # Drop MIGRATE.md into home dir if not already present.
     _migrate_src = os.path.join(os.path.dirname(__file__), '..', 'MIGRATE.md')
@@ -380,9 +396,6 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     _wait_for_socket(reg[name]['socket'])
 
     _inject_startup_context(name, home)
-
-    if initial_prompt:
-        cmd_send(name, initial_prompt, sender='cmux', quiet=True)
 
     # Detect and store Claude session ID after message injection — JSONL is created
     # lazily (often after the first exchange), so checking immediately after socket

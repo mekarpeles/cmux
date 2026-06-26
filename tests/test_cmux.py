@@ -739,18 +739,26 @@ class TestSessionContinuity(_CmuxBase):
     """Tests for home dir scaffolding, session ID tracking, workflow/identity injection."""
 
     def test_up_injects_initial_prompt_as_message(self):
-        """cmux up injects initial_prompt as a message; agent creates identity.md themselves."""
+        """cmux up writes initial_prompt to initial-prompt.md and @-references it in the startup message."""
         name = f'sc{_rnd()}'
         _cmux('agent', 'register', name, '--no-inject', '--', 'You are a test agent.',
               state_dir=self.state_dir)
         self._start(name, '--no-inject')
         _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
-        time.sleep(4.0)  # onboarding (1 msg) + initial_prompt, each ~1.5s apart
+        time.sleep(2.5)  # allow startup message delivery
+
+        # initial-prompt.md should be written to the agent's home dir
+        home = os.path.join(self.state_dir, name)
+        prompt_file = os.path.join(home, 'initial-prompt.md')
+        self.assertTrue(os.path.exists(prompt_file), 'initial-prompt.md should exist in home dir')
+        self.assertIn('You are a test agent', open(prompt_file).read())
+
+        # The startup inbox message should @-reference the prompt file
         inbox = os.path.join(self.state_dir, f'{name}.inbox.jsonl')
         self.assertTrue(os.path.exists(inbox), 'inbox should exist')
         content = open(inbox).read()
-        self.assertIn('You are a test agent', content,
-                      'initial_prompt should appear as an injected message')
+        self.assertIn('initial-prompt.md', content,
+                      'startup message should reference @initial-prompt.md')
 
     def test_up_does_not_overwrite_existing_identity(self):
         """Existing identity.md is never overwritten by initial_prompt."""
