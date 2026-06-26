@@ -326,6 +326,39 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
 
     os.makedirs(STATE_DIR, exist_ok=True)
     home = os.path.join(STATE_DIR, name)
+
+    # Dangling session: home dir exists with a stale last-session-id but the agent
+    # was removed from the DB (rm'd without archiving under old behaviour).
+    # Only triggers when last-session-id is present — the real risk is silently
+    # resuming a session the user thought they'd deleted.
+    _session_id_path = os.path.join(home, 'last-session-id')
+    if os.path.isdir(home) and reg_info is None and os.path.exists(_session_id_path):
+        print(f"cmux: dangling agent '{name}' — removed from registry but home dir was not archived.")
+        if sys.stdin.isatty():
+            try:
+                choice = input("  [A]rchive, [d]elete, [c]reate fresh: ").strip().lower() or 'a'
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(1)
+        else:
+            choice = 'a'  # non-interactive: archive by default
+            print("  non-interactive — archiving by default")
+        if choice == 'd':
+            import shutil as _shutil
+            _shutil.rmtree(home)
+        elif choice == 'c':
+            try:
+                os.unlink(_session_id_path)
+            except FileNotFoundError:
+                pass
+        else:  # 'a' or anything else
+            import shutil as _shutil
+            archive_dir = os.path.join(STATE_DIR, 'archive')
+            os.makedirs(archive_dir, exist_ok=True)
+            dest = os.path.join(archive_dir, f'{int(time.time())}_{name}')
+            _shutil.move(home, dest)
+            print(f"  archived → {dest}")
+
     os.makedirs(home, exist_ok=True)
 
     # Seed identity.md from --identity path on first start (never overwrites).
@@ -748,6 +781,10 @@ def cmd_rm(name, force=False):
               file=sys.stderr)
         sys.exit(1)
     db.remove_agent(name)
+    reg = load_registry()
+    if name in reg:
+        del reg[name]
+        save_registry(reg)
     home = os.path.join(STATE_DIR, name)
     if os.path.isdir(home):
         if force:
