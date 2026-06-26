@@ -745,7 +745,7 @@ class TestSessionContinuity(_CmuxBase):
               state_dir=self.state_dir)
         self._start(name, '--no-inject')
         _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
-        time.sleep(4.0)  # onboarding (x2) + initial_prompt, each ~1s apart
+        time.sleep(4.0)  # onboarding (1 msg) + initial_prompt, each ~1.5s apart
         inbox = os.path.join(self.state_dir, f'{name}.inbox.jsonl')
         self.assertTrue(os.path.exists(inbox), 'inbox should exist')
         content = open(inbox).read()
@@ -877,10 +877,11 @@ class TestSessionContinuity(_CmuxBase):
         try:
             with _patch('cmux_lib.cli.cmd_send') as mock_send:
                 _cli_module_for_session._inject_startup_context(name, home)
-            self.assertEqual(mock_send.call_count, 2)
-            msgs = [call[0][1] for call in mock_send.call_args_list]
-            self.assertTrue(any('ONBOARDING.md' in m for m in msgs))
-            self.assertTrue(any('IDENTITY_GUIDE.md' in m for m in msgs))
+            self.assertEqual(mock_send.call_count, 1)
+            msg = mock_send.call_args[0][1]
+            self.assertIn('ONBOARDING.md', msg)
+            self.assertIn('IDENTITY_GUIDE.md', msg)
+            self.assertIn(name, msg)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 

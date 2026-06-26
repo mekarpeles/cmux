@@ -29,16 +29,24 @@ _PERM_PATTERNS = [
     'workspace trust',
 ]
 
-# Numbered-list file permission prompts (create/edit/read). These need '2 Enter'
-# to approve for the session — Escape would deny the operation.
-_NUMBERED_PERM_PATTERNS = [
+# Three-option prompts where option 2 is "Yes, allow for session".
+# Send '2' to approve for the whole session.
+_ALLOW_SESSION_PATTERNS = [
     'allow reading',
     'allow all edits',
+    'allow all',
+]
+
+# Two-option prompts (1. Yes / 2. No) — bash commands, simple confirmations.
+# Send '1' to approve once. Sending '2' here would DENY the operation.
+_APPROVE_ONCE_PATTERNS = [
     'do you want to proceed',
     'do you want to create',
     'do you want to edit',
     'do you want to write',
     'do you want to delete',
+    'do you want to run',
+    'do you want to execute',
 ]
 
 
@@ -183,18 +191,22 @@ def make_deliver_file(name: str):
 def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
     """Background thread: poll for permission prompts and auto-dismiss.
 
-    Two prompt types require different responses:
-    - File-read prompts (numbered list, 'allow reading'): send '2 Enter' to
-      approve reading for the session. Sending Escape here would DENY the read.
-    - Tool-use / trust prompts: send Escape to dismiss.
-
-    After either action, injects a notification so the agent knows what happened.
+    Three prompt types, three responses:
+    - 'allow' in options (3-option): send '2' — "Yes, allow for session"
+    - 'do you want to X' without 'allow' (2-option: 1.Yes/2.No): send '1' — approve once
+    - Tool-use / trust prompts: send Escape to dismiss
     """
     notify_msg = (
-        '[claudio@noreply]: A security/permission prompt was detected and '
-        'automatically dismissed. Something in our workflow triggered a blocking '
-        'security response — continuing with normal operation.'
+        '[claudio@noreply]: A permission prompt was detected and automatically '
+        'dismissed. Continuing with normal operation.'
     )
+
+    def _send_and_notify(key):
+        subprocess.run(['tmux', 'send-keys', '-t', target, key, 'Enter'], capture_output=True)
+        time.sleep(1.0)
+        subprocess.run(['tmux', 'send-keys', '-t', target, notify_msg])
+        subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
+
     while True:
         time.sleep(interval)
         result = subprocess.run(
@@ -204,12 +216,10 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
         if result.returncode != 0:
             continue
         pane_text = result.stdout.lower()
-        if any(pat in pane_text for pat in _NUMBERED_PERM_PATTERNS):
-            # Approve file-read for the session (option 2 in the numbered list)
-            subprocess.run(['tmux', 'send-keys', '-t', target, '2', 'Enter'], capture_output=True)
-            time.sleep(1.0)
-            subprocess.run(['tmux', 'send-keys', '-t', target, notify_msg])
-            subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
+        if any(pat in pane_text for pat in _ALLOW_SESSION_PATTERNS):
+            _send_and_notify('2')  # "Yes, allow for session"
+        elif any(pat in pane_text for pat in _APPROVE_ONCE_PATTERNS):
+            _send_and_notify('1')  # "Yes" on a 2-option prompt
         elif any(pat in pane_text for pat in _PERM_PATTERNS):
             subprocess.run(['tmux', 'send-keys', '-t', target, 'Escape'], capture_output=True)
             time.sleep(1.0)

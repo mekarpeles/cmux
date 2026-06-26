@@ -251,12 +251,14 @@ def _inject_startup_context(name, home):
     if not os.path.exists(identity_path):
         onboarding = os.path.join(_PKG_DIR, 'ONBOARDING.md')
         identity_guide = os.path.join(_PKG_DIR, 'IDENTITY_GUIDE.md')
-        cmd_send(name, f'@{onboarding}', sender='cmux')
-        cmd_send(name, f'@{identity_guide}', sender='cmux')
+        # Single message: name/home inline so agent never shells out, plus @file refs
+        cmd_send(name,
+                 f'Session: "{name}" — home: {home} @{onboarding} @{identity_guide}',
+                 sender='cmux', quiet=True)
     else:
         wakeup_tpl = os.path.join(_PKG_DIR, 'WAKEUP.md')
         msg = open(wakeup_tpl).read().strip().replace('{name}', name)
-        cmd_send(name, msg, sender='cmux')
+        cmd_send(name, msg, sender='cmux', quiet=True)
 
 
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False, unblock=False):
@@ -380,7 +382,7 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     _inject_startup_context(name, home)
 
     if initial_prompt:
-        cmd_send(name, initial_prompt, sender='cmux')
+        cmd_send(name, initial_prompt, sender='cmux', quiet=True)
 
     # Detect and store Claude session ID after message injection — JSONL is created
     # lazily (often after the first exchange), so checking immediately after socket
@@ -492,7 +494,7 @@ def cmd_ls():
         print(f'\n  cmux up <name>   or   cmux -s <workspace>   to bring agents up')
 
 
-def cmd_send(name, message, sender=None):
+def cmd_send(name, message, sender=None, quiet=False):
     """Enqueue a message to a named session."""
     reg = load_registry()
     if name not in reg:
@@ -519,7 +521,8 @@ def cmd_send(name, message, sender=None):
         s.close()
         result = json.loads(ack) if ack else {}
         if result.get('ok'):
-            print(f"cmux: message queued for agent '{name}'")
+            if not quiet:
+                print(f"cmux: message queued for agent '{name}'")
         else:
             print(f"cmux: daemon error — {result.get('error', 'unknown')}", file=sys.stderr)
             sys.exit(1)
