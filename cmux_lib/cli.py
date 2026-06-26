@@ -249,11 +249,11 @@ def _inject_startup_context(name, home):
     """Inject onboarding (first start) or a one-line wakeup (subsequent starts)."""
     identity_path = os.path.join(home, 'identity.md')
     if not os.path.exists(identity_path):
-        onboarding = os.path.join(_PKG_DIR, '..', 'ONBOARDING.md')
-        cmd_send(name, f'@{os.path.normpath(onboarding)}', sender='cmux')
+        onboarding = os.path.join(_PKG_DIR, 'ONBOARDING.md')
+        cmd_send(name, f'@{onboarding}', sender='cmux')
     else:
-        wakeup_tpl = os.path.join(_PKG_DIR, '..', 'WAKEUP.md')
-        msg = open(os.path.normpath(wakeup_tpl)).read().strip().replace('{name}', name)
+        wakeup_tpl = os.path.join(_PKG_DIR, 'WAKEUP.md')
+        msg = open(wakeup_tpl).read().strip().replace('{name}', name)
         cmd_send(name, msg, sender='cmux')
 
 
@@ -811,6 +811,7 @@ Usage:
   cmux detach <agent>                       Detach (agent keeps running)
   cmux inbox <agent>                        Print and clear queued messages (--no-inject agents)
   cmux check                                Check all agents for permission-prompt blockage
+  cmux upgrade                              Upgrade cmux to the latest version from GitHub
 
   start / stop still work as aliases for up / down.
   First start launches fresh; subsequent starts resume via --resume <session-id>.
@@ -839,6 +840,29 @@ def _require_tmux():
         sys.exit(1)
 
 
+def cmd_upgrade():
+    """Upgrade cmux to the latest version from GitHub."""
+    import tempfile as _tempfile
+    import shutil as _shutil
+    tmp = _tempfile.mkdtemp()
+    try:
+        print('cmux: cloning latest...')
+        r = subprocess.run(
+            ['git', 'clone', '--depth=1', 'https://github.com/mekarpeles/cmux.git', os.path.join(tmp, 'cmux')],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            print(f'cmux: clone failed — {r.stderr.strip()}', file=sys.stderr)
+            sys.exit(1)
+        print('cmux: upgrading...')
+        r2 = subprocess.run(['pipx', 'install', '--force', os.path.join(tmp, 'cmux')])
+        if r2.returncode != 0:
+            sys.exit(r2.returncode)
+        print('cmux: upgrade complete.')
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ('-h', '--help'):
@@ -847,6 +871,10 @@ def main():
 
     if args[0] in ('--wizard', 'wizard'):
         cmd_wizard()
+        return
+
+    if args[0] == 'upgrade':
+        cmd_upgrade()
         return
 
     if args[0] == 'run':

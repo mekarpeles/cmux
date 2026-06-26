@@ -16,3 +16,6 @@ cmux = "cmux_lib.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["cmux_lib*"]
+
+[tool.setuptools.package-data]
+cmux_lib = ["*.md"]
