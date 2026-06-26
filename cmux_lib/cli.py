@@ -441,6 +441,25 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
             check=True
         )
 
+    # Give claude a moment to start, then verify the window is still alive.
+    # If it exited immediately (e.g. bad flag, missing binary), the session may
+    # already be gone — surface a useful error before we try to attach.
+    time.sleep(0.5)
+    if not _window_exists(tmux_sess, name):
+        # Capture recent pane output to explain why claude exited.
+        r = subprocess.run(
+            ['tmux', 'capture-pane', '-t', f'{tmux_sess}:{name}', '-p'],
+            capture_output=True, text=True,
+        )
+        output = r.stdout.strip()
+        print(f"cmux: claude exited immediately in '{tmux_sess}:{name}'", file=sys.stderr)
+        if output:
+            print(f"  last output:\n{output}", file=sys.stderr)
+        else:
+            print(f"  (no output captured — window already closed)", file=sys.stderr)
+        print(f"  cmd: {claude_cmd}", file=sys.stderr)
+        sys.exit(1)
+
     daemon_log = os.path.join(STATE_DIR, f'{name}.daemon.log')
     try:
         os.unlink(os.path.join(STATE_DIR, f'{name}.daemon.pid'))
