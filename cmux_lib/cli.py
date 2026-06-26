@@ -416,9 +416,9 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     env_prefix = f'CMUX_SESSION_NAME={name} CLAUDIO_STATE_DIR={home}'
     allowed_tools_flag = f' --allowedTools {allowed_tools}' if allowed_tools else ''
     if stored_id:
-        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}{allowed_tools_flag} --dangerouslySkipPermissions'
+        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}{allowed_tools_flag}'
     else:
-        claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag} --dangerouslySkipPermissions'
+        claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag}'
 
     # Scope session detection to the CWD we're launching from — avoids picking up
     # other active Claude sessions as false positives.
