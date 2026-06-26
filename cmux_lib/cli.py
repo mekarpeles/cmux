@@ -424,9 +424,9 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     env_prefix = f'CMUX_SESSION_NAME={name} CLAUDIO_STATE_DIR={home}'
     allowed_tools_flag = f' --allowedTools {allowed_tools}' if allowed_tools else ''
     if stored_id:
-        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}{allowed_tools_flag} --permission-mode bypassPermissions'
+        claude_cmd = f'{env_prefix} {claude_bin} --resume {stored_id}{allowed_tools_flag}'
     else:
-        claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag} --permission-mode bypassPermissions'
+        claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag}'
 
     # Scope session detection to the CWD we're launching from — avoids picking up
     # other active Claude sessions as false positives.
@@ -467,24 +467,6 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
             print(f"  (no output captured — window already closed)", file=sys.stderr)
         print(f"  cmd: {claude_cmd}", file=sys.stderr)
         sys.exit(1)
-
-    # Auto-accept the --permission-mode bypassPermissions confirmation screen.
-    # Claude shows "❯ 1. No, exit  2. Yes, I accept" — send '2' + Enter, then
-    # poll until the bypass screen clears before starting the daemon (more reliable
-    # than a fixed sleep).
-    subprocess.run(
-        ['tmux', 'send-keys', '-t', target, '2', 'Enter'],
-        capture_output=True,
-    )
-    _deadline = time.time() + 15
-    while time.time() < _deadline:
-        _r = subprocess.run(
-            ['tmux', 'capture-pane', '-t', target, '-p'],
-            capture_output=True, text=True,
-        )
-        if 'bypass permissions mode' not in _r.stdout.lower():
-            break
-        time.sleep(0.3)
 
     daemon_log = os.path.join(STATE_DIR, f'{name}.daemon.log')
     try:
