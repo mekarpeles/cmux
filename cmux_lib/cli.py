@@ -13,9 +13,6 @@ from cmux_lib.daemon import _PERM_PATTERNS, _TRUST_DIALOG_PATTERNS
 STATE_DIR = os.environ.get('CMUX_STATE_DIR', os.path.expanduser('~/.cmux'))
 REGISTRY = os.path.join(STATE_DIR, 'sessions.json')
 MAX_MESSAGE_LEN = 2000
-# Claude's own config file — tracks per-directory folder-trust acceptance.
-# Overridable so tests never touch the real ~/.claude.json.
-CLAUDE_CONFIG_PATH = os.environ.get('CMUX_CLAUDE_CONFIG', os.path.expanduser('~/.claude.json'))
 
 # Known agent metadata for `cmux agent import-sessions`.
 # workspace=None means standalone (own tmux session), not ol-loop.
@@ -95,27 +92,6 @@ def _tmux_session(name, workspace=None):
 def _tmux_target(name, workspace=None):
     """Tmux target for send-keys / capture-pane: session:window."""
     return f'{_tmux_session(name, workspace)}:{name}'
-
-
-def _pretrust_workspace(cwd):
-    """Mark cwd as trusted in Claude's config before launch.
-
-    Without this, Claude's interactive folder-trust dialog ("Quick safety
-    check: Is this a project you created or one you trust?") blocks startup
-    the first time it's run in a given directory. cmux always launches into
-    directories cmux itself manages, so the trust is implicit — pre-accepting
-    it avoids the dialog rather than relying on the daemon to dismiss it after
-    the fact. Preserves any existing project entry; only sets the flag.
-    """
-    try:
-        with open(CLAUDE_CONFIG_PATH) as f:
-            config = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        config = {}
-    projects = config.setdefault('projects', {})
-    projects.setdefault(cwd, {})['hasTrustDialogAccepted'] = True
-    with open(CLAUDE_CONFIG_PATH, 'w') as f:
-        json.dump(config, f, indent=2)
 
 
 def _cleanup_files(name):
@@ -457,8 +433,6 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     _agent_cwd = os.getcwd()
     _project_dir = _cwd_to_claude_project_dir(_agent_cwd)
     _pre_sessions = _snapshot_claude_sessions(project_dir=_project_dir)
-
-    _pretrust_workspace(_agent_cwd)
 
     sess_exists = subprocess.run(
         ['tmux', 'has-session', '-t', tmux_sess], capture_output=True
