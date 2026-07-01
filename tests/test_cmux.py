@@ -29,6 +29,10 @@ def _cmux(*args, state_dir, check=True):
     # Disable session-detect retries — fake_claude creates no JSONL files.
     env['CMUX_SESSION_DETECT_RETRIES'] = '1'
     env['CMUX_SESSION_DETECT_INTERVAL'] = '0'
+    # Isolate Claude's trust config inside state_dir — cmd_start pretrusts the
+    # launch cwd on every `up`, and without this override it would write to
+    # the real ~/.claude.json on whatever machine runs the tests.
+    env['CMUX_CLAUDE_CONFIG'] = os.path.join(state_dir, 'claude.json')
     return subprocess.run(
         [CMUX, *args],
         capture_output=True, text=True, env=env,
@@ -321,6 +325,87 @@ class TestCmdCheck(unittest.TestCase):
             _cli_module.cmd_check()
             output = mock_out.getvalue()
         self.assertIn('No agents running', output)
+
+    def test_stuck_agent_detected_folder_trust_dialog(self):
+        # Verbatim pane capture from Claude Code's folder-trust dialog. Before
+        # the fix, none of _PERM_PATTERNS matched this text, so `cmux check`
+        # reported [OK] for an agent stalled waiting on this prompt.
+        pane_text = (
+            ' Accessing workspace:\n\n'
+            ' /Users/mek/.cmux/alice\n\n'
+            ' Quick safety check: Is this a project you created or one you trust? '
+            '(Like your\n own code, a well-known open source project, or work from '
+            'your team). If not,\n take a moment to review what\'s in this folder first.\n\n'
+            ' Claude Code\'ll be able to read, edit, and execute files here.\n\n'
+            ' Security guide\n\n'
+            ' ❯ 1. Yes, I trust this folder\n'
+            '   2. No, exit\n\n'
+            ' Enter to confirm · Esc to cancel\n'
+        )
+        output = self._run_check(pane_text)
+        self.assertIn('[STUCK]', output)
+
+
+# ------------------------------------------------------------------
+# Unit tests for _pretrust_workspace() in cli.py
+# ------------------------------------------------------------------
+
+class TestPretrustWorkspace(unittest.TestCase):
+    """Unit tests for _pretrust_workspace — pre-accepts Claude's folder-trust
+    dialog for a cwd so it never blocks an interactive cmux launch."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='cmux-pretrust-test-')
+        self.config_path = os.path.join(self.tmp, 'claude.json')
+        self._patcher = patch.object(_cli_module, 'CLAUDE_CONFIG_PATH', self.config_path)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_creates_config_when_missing(self):
+        self.assertFalse(os.path.exists(self.config_path))
+        _cli_module._pretrust_workspace('/Users/mek/.cmux/alice')
+        config = json.load(open(self.config_path))
+        self.assertTrue(config['projects']['/Users/mek/.cmux/alice']['hasTrustDialogAccepted'])
+
+    def test_recovers_from_corrupt_json(self):
+        with open(self.config_path, 'w') as f:
+            f.write('{not valid json')
+        _cli_module._pretrust_workspace('/Users/mek/.cmux/alice')
+        config = json.load(open(self.config_path))
+        self.assertTrue(config['projects']['/Users/mek/.cmux/alice']['hasTrustDialogAccepted'])
+
+    def test_preserves_other_top_level_keys(self):
+        with open(self.config_path, 'w') as f:
+            json.dump({'anonymousId': 'abc123', 'projects': {}}, f)
+        _cli_module._pretrust_workspace('/Users/mek/.cmux/alice')
+        config = json.load(open(self.config_path))
+        self.assertEqual(config['anonymousId'], 'abc123')
+
+    def test_preserves_other_project_entries(self):
+        with open(self.config_path, 'w') as f:
+            json.dump({'projects': {'/Users/mek/Projects': {'hasTrustDialogAccepted': False, 'lastCost': 5}}}, f)
+        _cli_module._pretrust_workspace('/Users/mek/.cmux/alice')
+        config = json.load(open(self.config_path))
+        self.assertEqual(config['projects']['/Users/mek/Projects'], {'hasTrustDialogAccepted': False, 'lastCost': 5})
+        self.assertTrue(config['projects']['/Users/mek/.cmux/alice']['hasTrustDialogAccepted'])
+
+    def test_preserves_other_fields_on_existing_entry_for_same_cwd(self):
+        with open(self.config_path, 'w') as f:
+            json.dump({'projects': {'/Users/mek/.cmux/alice': {'hasTrustDialogAccepted': False, 'lastSessionId': 'xyz'}}}, f)
+        _cli_module._pretrust_workspace('/Users/mek/.cmux/alice')
+        config = json.load(open(self.config_path))
+        entry = config['projects']['/Users/mek/.cmux/alice']
+        self.assertTrue(entry['hasTrustDialogAccepted'])
+        self.assertEqual(entry['lastSessionId'], 'xyz')
+
+    def test_idempotent(self):
+        _cli_module._pretrust_workspace('/Users/mek/.cmux/alice')
+        _cli_module._pretrust_workspace('/Users/mek/.cmux/alice')
+        config = json.load(open(self.config_path))
+        self.assertTrue(config['projects']['/Users/mek/.cmux/alice']['hasTrustDialogAccepted'])
 
 
 # ------------------------------------------------------------------
@@ -649,6 +734,101 @@ class TestUnblockWatcher(unittest.TestCase):
 
         self.assertEqual(len(send_key_calls), 0, 'no send-keys calls on a clean pane')
 
+    def test_watcher_trusts_folder_on_trust_dialog(self):
+        """Folder-trust dialog: watcher sends '1' + Enter — accepts the default
+        "Yes, I trust this folder" option instead of Escape."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        keys_sent = []
+        target = 'cmux-trust:test'
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_list = list(cmd)
+            if 'capture-pane' in cmd_list:
+                result.stdout = (
+                    'Quick safety check: Is this a project you created or one you trust?\n'
+                    '❯ 1. Yes, I trust this folder\n  2. No, exit'
+                )
+            elif 'send-keys' in cmd_list:
+                keys_sent.append(cmd_list)
+            return result
+
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run), \
+             patch('time.sleep', return_value=None):
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01), daemon=True)
+            t.start()
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not keys_sent:
+                time.sleep(0.05)
+
+        self.assertTrue(keys_sent, 'watcher should have sent keys for the trust dialog')
+        first_call = keys_sent[0]
+        self.assertIn('1', first_call, "watcher must send '1' to accept the trust prompt")
+        self.assertNotIn('Escape', first_call, 'Escape hits "Esc to cancel" and quits Claude')
+
+    def test_watcher_never_sends_escape_on_trust_dialog(self):
+        """Regression guard: Escape on this dialog quits Claude and kills the
+        tmux window (verified empirically against the real dialog) — the
+        watcher must never send it for trust-dialog text."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        escape_sent = threading.Event()
+        target = f'cmux-trust-esc-{_rnd()}:test'
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_list = list(cmd)
+            if 'capture-pane' in cmd_list:
+                result.stdout = 'Quick safety check: Is this a project you created or one you trust?'
+            elif 'send-keys' in cmd_list and 'Escape' in cmd_list and target in cmd_list:
+                escape_sent.set()
+            return result
+
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05), daemon=True)
+            t.start()
+            self.assertFalse(escape_sent.wait(timeout=0.5), 'Escape must never be sent on the trust dialog')
+
+
+class TestIsIdleOnTrustDialog(unittest.TestCase):
+    """Regression test: is_idle() must not treat the trust dialog as a ready prompt.
+
+    The dialog's highlighted option is prefixed with the same '❯' glyph
+    is_idle() looks for on Claude's normal input prompt. It happens to still
+    return False today because of the existing "text after ❯ isn't just the
+    ghost hint" check — this test locks that behavior in so a future tweak to
+    that heuristic can't silently regress it.
+    """
+
+    def test_is_idle_false_on_trust_dialog(self):
+        from cmux_lib.daemon import make_is_idle
+
+        pane_text = (
+            ' Quick safety check: Is this a project you created or one you trust?\n\n'
+            ' ❯ 1. Yes, I trust this folder\n'
+            '   2. No, exit\n\n'
+            ' Enter to confirm · Esc to cancel\n'
+        )
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_list = list(cmd)
+            if 'capture-pane' in cmd_list:
+                result.stdout = pane_text
+            elif 'display-message' in cmd_list:
+                result.stdout = '1'  # cursor sits right after the '❯ ' marker
+            return result
+
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+            is_idle = make_is_idle('cmux-trust-idle:test')
+            self.assertFalse(is_idle(), 'trust dialog must never be reported as idle/ready')
+
 
 # ------------------------------------------------------------------
 # Integration tests for --unblock flag
@@ -670,6 +850,17 @@ class TestUpDownRm(_CmuxBase):
         self._started.append(name)
         home = os.path.join(self.state_dir, name)
         self.assertTrue(os.path.isdir(home), 'agent home dir should exist after up')
+
+    def test_up_pretrusts_launch_cwd(self):
+        """cmux up must pre-accept Claude's folder-trust dialog for the launch
+        cwd so an unattended `claude` process never blocks on it."""
+        name = f'up{_rnd()}'
+        _cmux('up', name, '-d', state_dir=self.state_dir)
+        self._started.append(name)
+        claude_config_path = os.path.join(self.state_dir, 'claude.json')
+        config = json.load(open(claude_config_path))
+        cwd = os.getcwd()
+        self.assertTrue(config['projects'][cwd]['hasTrustDialogAccepted'])
 
     def test_start_still_works_as_alias(self):
         name = f'st{_rnd()}'
