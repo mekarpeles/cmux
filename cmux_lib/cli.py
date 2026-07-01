@@ -8,7 +8,7 @@ import sys
 import time
 
 from cmux_lib import db
-from cmux_lib.daemon import _PERM_PATTERNS
+from cmux_lib.daemon import _PERM_PATTERNS, _TRUST_DIALOG_PATTERNS
 
 STATE_DIR = os.environ.get('CMUX_STATE_DIR', os.path.expanduser('~/.cmux'))
 REGISTRY = os.path.join(STATE_DIR, 'sessions.json')
@@ -907,7 +907,8 @@ def cmd_check():
         )
         pane_text = r.stdout.lower() if r.returncode == 0 else ''
 
-        is_stuck = any(pat in pane_text for pat in _PERM_PATTERNS)
+        is_stuck = any(pat in pane_text for pat in _PERM_PATTERNS) or \
+            any(pat in pane_text for pat in _TRUST_DIALOG_PATTERNS)
         if is_stuck:
             stuck.append((name, target))
             print(f'  [STUCK] {name:<16} — blocked, needs interaction ({target})')
@@ -1019,6 +1020,9 @@ Usage:
   cmux inbox <agent>                        Print and clear queued messages (--no-inject agents)
   cmux check                                Check all agents for permission-prompt blockage
   cmux upgrade                              Upgrade cmux to the latest version from GitHub
+  cmux upgrade --testing [branch]           Install from a branch (default: 'testing') instead
+                                             of main — for validating in-progress fixes on one
+                                             machine without affecting `cmux upgrade` elsewhere
 
   start / stop still work as aliases for up / down.
   First start launches fresh; subsequent starts resume via --resume <session-id>.
@@ -1047,31 +1051,54 @@ def _require_tmux():
         sys.exit(1)
 
 
-def cmd_upgrade():
-    """Upgrade cmux to the latest version from GitHub."""
+def cmd_upgrade(branch=None):
+    """Upgrade cmux from GitHub.
+
+    branch=None installs the default branch (main) — the stable path every
+    agent gets from a plain `cmux upgrade`. Passing a branch (via
+    --testing [branch]) installs that branch instead, so an in-progress fix
+    can be validated on one machine without changing what `cmux upgrade`
+    installs anywhere else — nothing about the default path is touched.
+    """
     import tempfile as _tempfile
     import shutil as _shutil
     tmp = _tempfile.mkdtemp()
     try:
-        print('cmux: cloning latest...')
-        r = subprocess.run(
-            ['git', 'clone', '--depth=1', 'https://github.com/mekarpeles/cmux.git', os.path.join(tmp, 'cmux')],
-            capture_output=True, text=True,
-        )
+        clone_cmd = ['git', 'clone', '--depth=1']
+        if branch:
+            clone_cmd += ['--branch', branch]
+        clone_cmd += ['https://github.com/mekarpeles/cmux.git', os.path.join(tmp, 'cmux')]
+        label = f"testing branch '{branch}'" if branch else 'latest'
+        print(f'cmux: cloning {label}...')
+        r = subprocess.run(clone_cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f'cmux: clone failed — {r.stderr.strip()}', file=sys.stderr)
             sys.exit(1)
+        if branch:
+            print(f"cmux: ⚠ installing from '{branch}' — not the stable release. "
+                  f"Run `cmux upgrade` (no flags) to return to main.")
         print('cmux: upgrading...')
         env = os.environ.copy()
         env['UV_VENV_CLEAR'] = '1'  # uv-backed pipx refuses to overwrite existing venv without this
+        env['UV_NO_CACHE'] = '1'    # prevent uv from serving stale cached sdists for VCS deps like claudio
         r2 = subprocess.run(['pipx', 'install', '--force', os.path.join(tmp, 'cmux')], env=env)
         if r2.returncode != 0:
             print(
                 'cmux: upgrade failed. If pipx uses uv and the venv already exists, run:\n'
-                '  UV_VENV_CLEAR=1 pipx install --force git+https://github.com/mekarpeles/cmux.git',
+                '  UV_VENV_CLEAR=1 UV_NO_CACHE=1 pipx install --force git+https://github.com/mekarpeles/cmux.git',
                 file=sys.stderr,
             )
             sys.exit(r2.returncode)
+        # Force-reinject claudio separately: pipx resolves VCS deps at install time and uv may
+        # cache them by commit hash even with UV_NO_CACHE, so an explicit inject guarantees the
+        # latest commit is fetched from GitHub regardless of what was cached.
+        print('cmux: upgrading claudio...')
+        r3 = subprocess.run(
+            ['pipx', 'inject', '--force', 'cmux', 'git+https://github.com/mekarpeles/claudio.git'],
+            env=env,
+        )
+        if r3.returncode != 0:
+            print('cmux: claudio upgrade failed — cmux itself was upgraded successfully.', file=sys.stderr)
         print('cmux: upgrade complete.')
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
@@ -1088,7 +1115,13 @@ def main():
         return
 
     if args[0] == 'upgrade':
-        cmd_upgrade()
+        upgrade_args = args[1:]
+        branch = None
+        if '--testing' in upgrade_args:
+            idx = upgrade_args.index('--testing')
+            rest = upgrade_args[idx + 1:]
+            branch = rest[0] if rest and not rest[0].startswith('-') else 'testing'
+        cmd_upgrade(branch=branch)
         return
 
     if args[0] == 'run':
