@@ -731,7 +731,11 @@ class TestUnblockWatcher(unittest.TestCase):
         keys_sent = []
         notify_sent = threading.Event()
         accepted = threading.Event()
-        target = 'cmux-trust:test'
+        # Randomized and target-filtered like the other watcher tests below —
+        # daemon threads are never explicitly stopped, so a lingering thread
+        # from an earlier test can still be calling the (now re-patched)
+        # subprocess.run mock while this test runs.
+        target = f'cmux-trust-{_rnd()}:test'
 
         dialog_text = (
             'Quick safety check: Is this a project you created or one you trust?\n'
@@ -742,7 +746,10 @@ class TestUnblockWatcher(unittest.TestCase):
         def mock_run(cmd, **kwargs):
             result = MagicMock()
             result.returncode = 0
+            result.stdout = ''
             cmd_list = list(cmd)
+            if target not in cmd_list:
+                return result
             if 'capture-pane' in cmd_list:
                 # Pane clears to the normal idle prompt only after '1'+Enter
                 # was actually sent — simulates the dialog responding to input.
@@ -779,11 +786,14 @@ class TestUnblockWatcher(unittest.TestCase):
         def mock_run(cmd, **kwargs):
             result = MagicMock()
             result.returncode = 0
+            result.stdout = ''
             cmd_list = list(cmd)
+            if target not in cmd_list:
+                return result
             if 'capture-pane' in cmd_list:
                 # Dialog never clears, no matter what's sent.
                 result.stdout = 'Quick safety check: Is this a project you created or one you trust?'
-            elif 'send-keys' in cmd_list and target in cmd_list:
+            elif 'send-keys' in cmd_list:
                 keys_sent.append(cmd_list)
             return result
 
@@ -814,10 +824,13 @@ class TestUnblockWatcher(unittest.TestCase):
         def mock_run(cmd, **kwargs):
             result = MagicMock()
             result.returncode = 0
+            result.stdout = ''
             cmd_list = list(cmd)
+            if target not in cmd_list:
+                return result
             if 'capture-pane' in cmd_list:
                 result.stdout = 'Quick safety check: Is this a project you created or one you trust?'
-            elif 'send-keys' in cmd_list and 'Escape' in cmd_list and target in cmd_list:
+            elif 'send-keys' in cmd_list and 'Escape' in cmd_list:
                 escape_sent.set()
             return result
 
