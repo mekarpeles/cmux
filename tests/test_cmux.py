@@ -322,6 +322,78 @@ class TestCmdCheck(unittest.TestCase):
             output = mock_out.getvalue()
         self.assertIn('No agents running', output)
 
+    def test_stuck_agent_detected_folder_trust_dialog(self):
+        # Verbatim pane capture from Claude Code's folder-trust dialog. Before
+        # the fix, none of _PERM_PATTERNS matched this text, so `cmux check`
+        # reported [OK] for an agent stalled waiting on this prompt.
+        pane_text = (
+            ' Accessing workspace:\n\n'
+            ' /Users/mek/.cmux/alice\n\n'
+            ' Quick safety check: Is this a project you created or one you trust? '
+            '(Like your\n own code, a well-known open source project, or work from '
+            'your team). If not,\n take a moment to review what\'s in this folder first.\n\n'
+            ' Claude Code\'ll be able to read, edit, and execute files here.\n\n'
+            ' Security guide\n\n'
+            ' ❯ 1. Yes, I trust this folder\n'
+            '   2. No, exit\n\n'
+            ' Enter to confirm · Esc to cancel\n'
+        )
+        output = self._run_check(pane_text)
+        self.assertIn('[STUCK]', output)
+
+
+# ------------------------------------------------------------------
+# Unit tests for `cmux upgrade --testing [branch]`
+# ------------------------------------------------------------------
+
+class TestUpgradeTesting(unittest.TestCase):
+    """cmux upgrade --testing installs a non-main branch on one machine
+    without changing what a plain `cmux upgrade` installs elsewhere."""
+
+    def test_upgrade_plain_defaults_to_main(self):
+        with patch.object(_cli_module, 'cmd_upgrade') as mock_upgrade, \
+             patch.object(sys, 'argv', ['cmux', 'upgrade']):
+            _cli_module.main()
+        mock_upgrade.assert_called_once_with(branch=None)
+
+    def test_upgrade_testing_with_no_branch_defaults_to_testing(self):
+        with patch.object(_cli_module, 'cmd_upgrade') as mock_upgrade, \
+             patch.object(sys, 'argv', ['cmux', 'upgrade', '--testing']):
+            _cli_module.main()
+        mock_upgrade.assert_called_once_with(branch='testing')
+
+    def test_upgrade_testing_with_explicit_branch(self):
+        with patch.object(_cli_module, 'cmd_upgrade') as mock_upgrade, \
+             patch.object(sys, 'argv', ['cmux', 'upgrade', '--testing', 'fix/folder-trust-dialog-check']):
+            _cli_module.main()
+        mock_upgrade.assert_called_once_with(branch='fix/folder-trust-dialog-check')
+
+    def _first_clone_call(self, branch):
+        """Run cmd_upgrade(branch) with a mocked, immediately-failing clone,
+        and return the git command it invoked."""
+        calls = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            result = MagicMock()
+            result.returncode = 1  # stop right after the clone call
+            result.stderr = 'stop here'
+            return result
+
+        with patch.object(_cli_module.subprocess, 'run', side_effect=mock_run), \
+             self.assertRaises(SystemExit):
+            _cli_module.cmd_upgrade(branch=branch)
+        return calls[0]
+
+    def test_upgrade_clones_main_when_no_branch_given(self):
+        clone_call = self._first_clone_call(branch=None)
+        self.assertNotIn('--branch', clone_call, 'plain upgrade must not pin a branch')
+
+    def test_upgrade_clones_given_branch(self):
+        clone_call = self._first_clone_call(branch='testing')
+        self.assertIn('--branch', clone_call)
+        self.assertEqual(clone_call[clone_call.index('--branch') + 1], 'testing')
+
 
 # ------------------------------------------------------------------
 # Unit tests for sanitize() in daemon.py
@@ -648,6 +720,159 @@ class TestUnblockWatcher(unittest.TestCase):
             time.sleep(0.3)  # allow ~6 poll iterations
 
         self.assertEqual(len(send_key_calls), 0, 'no send-keys calls on a clean pane')
+
+    def test_watcher_trusts_folder_on_trust_dialog(self):
+        """Folder-trust dialog: watcher sends '1' + Enter — accepts the default
+        "Yes, I trust this folder" option instead of Escape — then verifies
+        the dialog actually cleared before notifying."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        keys_sent = []
+        notify_sent = threading.Event()
+        accepted = threading.Event()
+        # Randomized and target-filtered like the other watcher tests below —
+        # daemon threads are never explicitly stopped, so a lingering thread
+        # from an earlier test can still be calling the (now re-patched)
+        # subprocess.run mock while this test runs.
+        target = f'cmux-trust-{_rnd()}:test'
+
+        dialog_text = (
+            'Quick safety check: Is this a project you created or one you trust?\n'
+            '❯ 1. Yes, I trust this folder\n  2. No, exit'
+        )
+        idle_text = '❯\xa0Try "write a test for <filepath>"'
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ''
+            cmd_list = list(cmd)
+            if target not in cmd_list:
+                return result
+            if 'capture-pane' in cmd_list:
+                # Pane clears to the normal idle prompt only after '1'+Enter
+                # was actually sent — simulates the dialog responding to input.
+                result.stdout = idle_text if accepted.is_set() else dialog_text
+            elif 'send-keys' in cmd_list:
+                keys_sent.append(cmd_list)
+                if cmd_list[-2:] == ['1', 'Enter']:
+                    accepted.set()
+                if any('[claudio@noreply]' in a for a in cmd_list):
+                    notify_sent.set()
+            return result
+
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run), \
+             patch('time.sleep', return_value=None):
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01), daemon=True)
+            t.start()
+            self.assertTrue(notify_sent.wait(timeout=5.0),
+                             'watcher should confirm the dialog cleared and notify')
+
+        first_call = keys_sent[0]
+        self.assertIn('1', first_call, "watcher must send '1' to accept the trust prompt")
+        self.assertNotIn('Escape', first_call, 'Escape hits "Esc to cancel" and quits Claude')
+
+    def test_watcher_no_notify_if_trust_dialog_persists(self):
+        """If accepting the dialog doesn't clear it (unexpected variant, e.g.
+        the default option isn't "Yes" in some future Claude Code version),
+        the watcher must not claim success — no "dismissed" notification."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        keys_sent = []
+        target = f'cmux-trust-stuck-{_rnd()}:test'
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ''
+            cmd_list = list(cmd)
+            if target not in cmd_list:
+                return result
+            if 'capture-pane' in cmd_list:
+                # Dialog never clears, no matter what's sent.
+                result.stdout = 'Quick safety check: Is this a project you created or one you trust?'
+            elif 'send-keys' in cmd_list:
+                keys_sent.append(cmd_list)
+            return result
+
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run), \
+             patch('time.sleep', return_value=None):
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01), daemon=True)
+            t.start()
+            # Event.wait's timeout isn't backed by the patched time.sleep, so
+            # this is a real wall-clock pause letting several poll+verify
+            # cycles run before we inspect what the watcher did.
+            threading.Event().wait(timeout=0.3)
+
+        accept_calls = [c for c in keys_sent if c[-2:] == ['1', 'Enter']]
+        notify_calls = [c for c in keys_sent if any('[claudio@noreply]' in a for a in c)]
+        self.assertTrue(accept_calls, 'watcher should still attempt to accept the dialog')
+        self.assertEqual(notify_calls, [], 'must not notify "dismissed" while the dialog is still showing')
+
+    def test_watcher_never_sends_escape_on_trust_dialog(self):
+        """Regression guard: Escape on this dialog quits Claude and kills the
+        tmux window (verified empirically against the real dialog) — the
+        watcher must never send it for trust-dialog text."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        escape_sent = threading.Event()
+        target = f'cmux-trust-esc-{_rnd()}:test'
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ''
+            cmd_list = list(cmd)
+            if target not in cmd_list:
+                return result
+            if 'capture-pane' in cmd_list:
+                result.stdout = 'Quick safety check: Is this a project you created or one you trust?'
+            elif 'send-keys' in cmd_list and 'Escape' in cmd_list:
+                escape_sent.set()
+            return result
+
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05), daemon=True)
+            t.start()
+            self.assertFalse(escape_sent.wait(timeout=0.5), 'Escape must never be sent on the trust dialog')
+
+
+class TestIsIdleOnTrustDialog(unittest.TestCase):
+    """Regression test: is_idle() must not treat the trust dialog as a ready prompt.
+
+    The dialog's highlighted option is prefixed with the same '❯' glyph
+    is_idle() looks for on Claude's normal input prompt. It happens to still
+    return False today because of the existing "text after ❯ isn't just the
+    ghost hint" check — this test locks that behavior in so a future tweak to
+    that heuristic can't silently regress it.
+    """
+
+    def test_is_idle_false_on_trust_dialog(self):
+        from cmux_lib.daemon import make_is_idle
+
+        pane_text = (
+            ' Quick safety check: Is this a project you created or one you trust?\n\n'
+            ' ❯ 1. Yes, I trust this folder\n'
+            '   2. No, exit\n\n'
+            ' Enter to confirm · Esc to cancel\n'
+        )
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_list = list(cmd)
+            if 'capture-pane' in cmd_list:
+                result.stdout = pane_text
+            elif 'display-message' in cmd_list:
+                result.stdout = '1'  # cursor sits right after the '❯ ' marker
+            return result
+
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+            is_idle = make_is_idle('cmux-trust-idle:test')
+            self.assertFalse(is_idle(), 'trust dialog must never be reported as idle/ready')
 
 
 # ------------------------------------------------------------------

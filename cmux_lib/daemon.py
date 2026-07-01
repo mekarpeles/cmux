@@ -23,7 +23,17 @@ _PERM_PATTERNS = [
     'no, and tell claude',
     'needs permission',
     '[y/n]',
-    # Directory-trust prompt (new project / relocated workspace)
+]
+
+# Folder-trust dialog ("Quick safety check: Is this a project you created or
+# one you trust?"). Distinct from _PERM_PATTERNS because its default option
+# is "1. Yes, I trust this folder" — Enter accepts it. Sending Escape here
+# (the _PERM_PATTERNS response) hits "Esc to cancel", which quits Claude and
+# kills the whole tmux window instead of unblocking it.
+_TRUST_DIALOG_PATTERNS = [
+    'quick safety check',
+    'yes, i trust this folder',
+    # Older/alternate phrasings, kept for forward/backward compatibility.
     'do you trust',
     'trust the files in this folder',
     'workspace trust',
@@ -193,10 +203,13 @@ def make_deliver_file(name: str):
 def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
     """Background thread: poll for permission prompts and auto-dismiss.
 
-    Three prompt types, three responses:
+    Four prompt types, four responses:
     - 'allow' in options (3-option): send '2' — "Yes, allow for session"
     - 'do you want to X' without 'allow' (2-option: 1.Yes/2.No): send '1' — approve once
-    - Tool-use / trust prompts: send Escape to dismiss
+    - Folder-trust dialog (2-option: 1.Yes trust/2.No exit): send '1' — trust it,
+      then verify the dialog actually cleared before notifying. Escape would
+      hit "Esc to cancel" and quit Claude, killing the window.
+    - Tool-use prompts: send Escape to dismiss
     """
     notify_msg = (
         '[claudio@noreply]: A permission prompt was detected and automatically '
@@ -206,6 +219,27 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
     def _send_and_notify(key):
         subprocess.run(['tmux', 'send-keys', '-t', target, key, 'Enter'], capture_output=True)
         time.sleep(1.0)
+        subprocess.run(['tmux', 'send-keys', '-t', target, notify_msg])
+        subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
+
+    def _trust_dialog_and_verify():
+        """Accept the folder-trust dialog, then re-check the pane before
+        notifying. Only one shot at this dialog is safe — sending an
+        unexpected key into an unrecognized variant of it could pick "No,
+        exit" instead of "Yes" — so confirm the dialog actually cleared
+        before claiming success. If it's still showing (or the window is
+        gone), stay quiet and let the next poll re-evaluate from scratch.
+        """
+        subprocess.run(['tmux', 'send-keys', '-t', target, '1', 'Enter'], capture_output=True)
+        time.sleep(1.0)
+        result = subprocess.run(
+            ['tmux', 'capture-pane', '-t', target, '-p', '-S', '-15'],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return  # window is gone — nothing left to notify
+        if any(pat in result.stdout.lower() for pat in _TRUST_DIALOG_PATTERNS):
+            return  # dialog still showing — leave it for the next poll
         subprocess.run(['tmux', 'send-keys', '-t', target, notify_msg])
         subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
 
@@ -222,6 +256,8 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
             _send_and_notify('2')  # "Yes, allow for session"
         elif any(pat in pane_text for pat in _APPROVE_ONCE_PATTERNS):
             _send_and_notify('1')  # "Yes" on a 2-option prompt
+        elif any(pat in pane_text for pat in _TRUST_DIALOG_PATTERNS):
+            _trust_dialog_and_verify()  # "Yes, I trust this folder" — verified
         elif any(pat in pane_text for pat in _PERM_PATTERNS):
             subprocess.run(['tmux', 'send-keys', '-t', target, 'Escape'], capture_output=True)
             time.sleep(1.0)
