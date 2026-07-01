@@ -343,6 +343,59 @@ class TestCmdCheck(unittest.TestCase):
 
 
 # ------------------------------------------------------------------
+# Unit tests for `cmux upgrade --testing [branch]`
+# ------------------------------------------------------------------
+
+class TestUpgradeTesting(unittest.TestCase):
+    """cmux upgrade --testing installs a non-main branch on one machine
+    without changing what a plain `cmux upgrade` installs elsewhere."""
+
+    def test_upgrade_plain_defaults_to_main(self):
+        with patch.object(_cli_module, 'cmd_upgrade') as mock_upgrade, \
+             patch.object(sys, 'argv', ['cmux', 'upgrade']):
+            _cli_module.main()
+        mock_upgrade.assert_called_once_with(branch=None)
+
+    def test_upgrade_testing_with_no_branch_defaults_to_testing(self):
+        with patch.object(_cli_module, 'cmd_upgrade') as mock_upgrade, \
+             patch.object(sys, 'argv', ['cmux', 'upgrade', '--testing']):
+            _cli_module.main()
+        mock_upgrade.assert_called_once_with(branch='testing')
+
+    def test_upgrade_testing_with_explicit_branch(self):
+        with patch.object(_cli_module, 'cmd_upgrade') as mock_upgrade, \
+             patch.object(sys, 'argv', ['cmux', 'upgrade', '--testing', 'fix/folder-trust-dialog-check']):
+            _cli_module.main()
+        mock_upgrade.assert_called_once_with(branch='fix/folder-trust-dialog-check')
+
+    def _first_clone_call(self, branch):
+        """Run cmd_upgrade(branch) with a mocked, immediately-failing clone,
+        and return the git command it invoked."""
+        calls = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            result = MagicMock()
+            result.returncode = 1  # stop right after the clone call
+            result.stderr = 'stop here'
+            return result
+
+        with patch.object(_cli_module.subprocess, 'run', side_effect=mock_run), \
+             self.assertRaises(SystemExit):
+            _cli_module.cmd_upgrade(branch=branch)
+        return calls[0]
+
+    def test_upgrade_clones_main_when_no_branch_given(self):
+        clone_call = self._first_clone_call(branch=None)
+        self.assertNotIn('--branch', clone_call, 'plain upgrade must not pin a branch')
+
+    def test_upgrade_clones_given_branch(self):
+        clone_call = self._first_clone_call(branch='testing')
+        self.assertIn('--branch', clone_call)
+        self.assertEqual(clone_call[clone_call.index('--branch') + 1], 'testing')
+
+
+# ------------------------------------------------------------------
 # Unit tests for sanitize() in daemon.py
 # ------------------------------------------------------------------
 
