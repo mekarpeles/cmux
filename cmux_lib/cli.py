@@ -1064,14 +1064,25 @@ def cmd_upgrade():
         print('cmux: upgrading...')
         env = os.environ.copy()
         env['UV_VENV_CLEAR'] = '1'  # uv-backed pipx refuses to overwrite existing venv without this
+        env['UV_NO_CACHE'] = '1'    # prevent uv from serving stale cached sdists for VCS deps like claudio
         r2 = subprocess.run(['pipx', 'install', '--force', os.path.join(tmp, 'cmux')], env=env)
         if r2.returncode != 0:
             print(
                 'cmux: upgrade failed. If pipx uses uv and the venv already exists, run:\n'
-                '  UV_VENV_CLEAR=1 pipx install --force git+https://github.com/mekarpeles/cmux.git',
+                '  UV_VENV_CLEAR=1 UV_NO_CACHE=1 pipx install --force git+https://github.com/mekarpeles/cmux.git',
                 file=sys.stderr,
             )
             sys.exit(r2.returncode)
+        # Force-reinject claudio separately: pipx resolves VCS deps at install time and uv may
+        # cache them by commit hash even with UV_NO_CACHE, so an explicit inject guarantees the
+        # latest commit is fetched from GitHub regardless of what was cached.
+        print('cmux: upgrading claudio...')
+        r3 = subprocess.run(
+            ['pipx', 'inject', '--force', 'cmux', 'git+https://github.com/mekarpeles/claudio.git'],
+            env=env,
+        )
+        if r3.returncode != 0:
+            print('cmux: claudio upgrade failed — cmux itself was upgraded successfully.', file=sys.stderr)
         print('cmux: upgrade complete.')
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
