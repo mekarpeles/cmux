@@ -150,11 +150,86 @@ def sanitize(text: str) -> str:
     return text.strip()
 
 
-# Messages longer than this trigger Claude Code's paste-detection heuristic:
-# tmux delivers the full string at once, readline sees a fast burst, and
-# Claude Code shows "[paste N lines]" instead of processing the message.
-# Work-around: write the body to a file and send an @file pointer instead.
+# Messages longer than this are redirected to an @file pointer. Historically
+# this dodged Claude Code's paste-detection heuristic; with bracketed-paste
+# injection (below) the heuristic no longer matters, but the redirect is kept
+# so huge bodies don't bloat the input line and the msg-*.md files remain an
+# on-disk record of what was delivered.
 _PASTE_THRESHOLD = 300
+
+# How many times to press Enter (with growing waits) before declaring a
+# delivery stuck. Submission is VERIFIED, not assumed — see _submitted().
+_SUBMIT_RETRIES = 5
+
+
+def _inject_text(target: str, text: str) -> None:
+    """Put text into the Claude input via tmux bracketed paste.
+
+    Why not plain send-keys: send-keys delivers the string as one
+    instantaneous key burst. Claude Code's paste-detection heuristic sees the
+    burst, enters paste-capture, and an Enter sent immediately afterwards is
+    often captured INTO the paste as a newline instead of submitting — the
+    message is left sitting unsubmitted in the input box (the long-standing
+    "stuck message" bug). A literal '@path' typed as keystrokes also pops the
+    file-mention autocomplete, where Enter selects the completion instead of
+    submitting.
+
+    Bracketed paste (paste-buffer -p) fixes both: the text arrives inside an
+    explicit ESC[200~ … ESC[201~ envelope, so the TUI knows exactly where the
+    paste ends — a subsequent Enter is unambiguously a keypress — and pasted
+    '@' does not trigger the autocomplete popup.
+    """
+    loaded = subprocess.run(
+        ['tmux', 'load-buffer', '-b', 'cmux-deliver', '-'],
+        input=text.encode(),
+    )
+    if loaded.returncode == 0:
+        subprocess.run(
+            ['tmux', 'paste-buffer', '-p', '-d', '-b', 'cmux-deliver', '-t', target],
+        )
+    else:
+        # Fallback: legacy typed injection (-l = literal, never key-name lookup).
+        subprocess.run(['tmux', 'send-keys', '-t', target, '-l', text])
+
+
+def _submitted(target: str, text: str) -> bool:
+    """True once the injected text is no longer sitting in the input line.
+
+    Checks the pane from the LAST ❯ prompt downward (the input box, including
+    wrapped continuation rows) for a probe prefix of the injected text. The
+    conversation echo of a successfully submitted message sits ABOVE the
+    prompt, so it never false-positives; the empty-input ghost hint doesn't
+    contain the probe either. If no prompt is visible at all (redraw, screen
+    switch), report submitted rather than retry-looping blind.
+    """
+    content = pane_content(target)
+    lines = content.split('\n')
+    prompt_idx = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith('❯'):
+            prompt_idx = i
+    if prompt_idx is None:
+        return True
+    probe = text[:24]
+    input_region = '\n'.join(lines[prompt_idx:])
+    return probe not in input_region
+
+
+def _submit(target: str, text: str) -> bool:
+    """Press Enter until the injected text actually leaves the input line.
+
+    A single Enter can be swallowed (paste-capture window, autocomplete
+    popup, mid-redraw). Verify-and-retry converts "usually submits" into
+    "submits or tells you it couldn't": each attempt presses Enter, waits
+    (growing backoff — also lets a popup/paste window close), and re-checks
+    the pane. Returns True on verified submission.
+    """
+    for attempt in range(_SUBMIT_RETRIES):
+        subprocess.run(['tmux', 'send-keys', '-t', target, 'Enter'])
+        time.sleep(0.4 + 0.3 * attempt)
+        if _submitted(target, text):
+            return True
+    return False
 
 
 def make_deliver(name: str, target: str):
@@ -167,7 +242,7 @@ def make_deliver(name: str, target: str):
 
         if len(label) + len(body) > _PASTE_THRESHOLD:
             # Write full message to a file; send a short @file pointer that
-            # Claude Code reads cleanly without triggering paste detection.
+            # Claude Code reads on its own (and that doubles as a record).
             os.makedirs(home, exist_ok=True)
             ts = int(time.time() * 1000)
             msg_path = os.path.join(home, f'msg-{ts}.md')
@@ -177,8 +252,16 @@ def make_deliver(name: str, target: str):
         else:
             text = sanitize(f'{label}{body}')
 
-        subprocess.run(['tmux', 'send-keys', '-t', target, text])
-        subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
+        _inject_text(target, text)
+        time.sleep(0.2)  # let the paste render before the first Enter
+        if not _submit(target, text):
+            # Loud, greppable failure — the message text is preserved in the
+            # input box (and, for long bodies, in the msg file), never lost.
+            print(
+                f'cmux: DELIVERY STUCK for {name!r} — injected text did not '
+                f'submit after {_SUBMIT_RETRIES} Enter presses: {text[:80]!r}',
+                file=sys.stderr, flush=True,
+            )
 
     return deliver
 
@@ -219,8 +302,8 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
     def _send_and_notify(key):
         subprocess.run(['tmux', 'send-keys', '-t', target, key, 'Enter'], capture_output=True)
         time.sleep(1.0)
-        subprocess.run(['tmux', 'send-keys', '-t', target, notify_msg])
-        subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
+        _inject_text(target, notify_msg)
+        _submit(target, notify_msg)
 
     def _trust_dialog_and_verify():
         """Accept the folder-trust dialog, then re-check the pane before
@@ -240,8 +323,8 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
             return  # window is gone — nothing left to notify
         if any(pat in result.stdout.lower() for pat in _TRUST_DIALOG_PATTERNS):
             return  # dialog still showing — leave it for the next poll
-        subprocess.run(['tmux', 'send-keys', '-t', target, notify_msg])
-        subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
+        _inject_text(target, notify_msg)
+        _submit(target, notify_msg)
 
     while True:
         time.sleep(interval)
@@ -261,8 +344,8 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
         elif any(pat in pane_text for pat in _PERM_PATTERNS):
             subprocess.run(['tmux', 'send-keys', '-t', target, 'Escape'], capture_output=True)
             time.sleep(1.0)
-            subprocess.run(['tmux', 'send-keys', '-t', target, notify_msg])
-            subprocess.run(['tmux', 'send-keys', '-t', target, '', 'Enter'])
+            _inject_text(target, notify_msg)
+            _submit(target, notify_msg)
 
 
 def _check_singleton(name: str) -> None:

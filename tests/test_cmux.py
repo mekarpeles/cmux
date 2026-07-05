@@ -684,8 +684,11 @@ class TestUnblockWatcher(unittest.TestCase):
             cmd_list = list(cmd)
             if 'capture-pane' in cmd_list:
                 result.stdout = 'needs permission'
-            elif 'send-keys' in cmd_list and any('[claudio@noreply]' in a for a in cmd_list):
+            elif 'load-buffer' in cmd_list and b'[claudio@noreply]' in kwargs.get('input', b''):
+                # notification now travels via bracketed paste (verified delivery)
                 notification_sent.set()
+            elif 'send-keys' in cmd_list and any('[claudio@noreply]' in a for a in cmd_list):
+                notification_sent.set()  # legacy fallback path
             return result
 
         target = 'cmux-notify:test'
@@ -748,6 +751,10 @@ class TestUnblockWatcher(unittest.TestCase):
             result.returncode = 0
             result.stdout = ''
             cmd_list = list(cmd)
+            if 'load-buffer' in cmd_list and b'[claudio@noreply]' in kwargs.get('input', b''):
+                # notification now travels via bracketed paste (verified delivery)
+                notify_sent.set()
+                return result
             if target not in cmd_list:
                 return result
             if 'capture-pane' in cmd_list:
@@ -1655,3 +1662,114 @@ class TestIdentityFlag(_CmuxBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ------------------------------------------------------------------
+# Unit tests for verified delivery (_inject_text / _submitted / _submit)
+# — the fix for the "message stuck in the input box" bug.
+# ------------------------------------------------------------------
+
+import cmux_lib.daemon as _daemon_module
+
+
+class TestVerifiedDelivery(unittest.TestCase):
+    def test_inject_uses_bracketed_paste(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch.object(_daemon_module.subprocess, 'run', side_effect=fake_run):
+            _daemon_module._inject_text('s:0', 'hello world')
+        self.assertEqual(calls[0][:2], ['tmux', 'load-buffer'])
+        self.assertIn('paste-buffer', calls[1])
+        self.assertIn('-p', calls[1], 'must be a BRACKETED paste (-p)')
+        self.assertNotIn('send-keys', [c[1] for c in calls])
+
+    def test_inject_falls_back_to_literal_send_keys(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return MagicMock(returncode=1 if cmd[1] == 'load-buffer' else 0)
+
+        with patch.object(_daemon_module.subprocess, 'run', side_effect=fake_run):
+            _daemon_module._inject_text('s:0', 'hello world')
+        self.assertEqual(calls[1][1], 'send-keys')
+        self.assertIn('-l', calls[1], 'fallback must type literally, never key-name lookup')
+
+    def test_submitted_detects_stuck_input(self):
+        pane = 'some scrollback\n❯ [cmux]: test-probe still sitting here\n  status bar'
+        with patch.object(_daemon_module, 'pane_content', return_value=pane):
+            self.assertFalse(_daemon_module._submitted('s:0', '[cmux]: test-probe still sitting here'))
+
+    def test_submitted_ignores_conversation_echo_and_ghost_hint(self):
+        # After a REAL submit: echo sits ABOVE the prompt, input shows only the ghost hint.
+        pane = '> [cmux]: test-probe message\n\n❯\xa0Try "create a util..."\n  status'
+        with patch.object(_daemon_module, 'pane_content', return_value=pane):
+            self.assertTrue(_daemon_module._submitted('s:0', '[cmux]: test-probe message'))
+
+    def test_submitted_true_when_no_prompt_visible(self):
+        with patch.object(_daemon_module, 'pane_content', return_value='redrawing…'):
+            self.assertTrue(_daemon_module._submitted('s:0', 'anything'))
+
+    def test_submit_retries_until_input_clears(self):
+        stuck = '❯ [cmux]: probe-xyz stuck'
+        clear = '> [cmux]: probe-xyz stuck\n❯\xa0'
+        panes = [stuck, stuck, clear]  # cleared on the 3rd check
+        enters = []
+
+        def fake_run(cmd, **kw):
+            if 'send-keys' in cmd and 'Enter' in cmd:
+                enters.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch.object(_daemon_module.subprocess, 'run', side_effect=fake_run), \
+             patch.object(_daemon_module, 'pane_content', side_effect=panes), \
+             patch.object(_daemon_module.time, 'sleep'):
+            ok = _daemon_module._submit('s:0', '[cmux]: probe-xyz stuck')
+        self.assertTrue(ok)
+        self.assertEqual(len(enters), 3, 'one Enter per verification attempt')
+
+    def test_submit_gives_up_loudly_after_retries(self):
+        stuck = '❯ [cmux]: probe-abc never leaves'
+        enters = []
+
+        def fake_run(cmd, **kw):
+            if 'send-keys' in cmd and 'Enter' in cmd:
+                enters.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch.object(_daemon_module.subprocess, 'run', side_effect=fake_run), \
+             patch.object(_daemon_module, 'pane_content', return_value=stuck), \
+             patch.object(_daemon_module.time, 'sleep'):
+            ok = _daemon_module._submit('s:0', '[cmux]: probe-abc never leaves')
+        self.assertFalse(ok)
+        self.assertEqual(len(enters), _daemon_module._SUBMIT_RETRIES)
+
+    def test_deliver_short_message_injects_and_submits(self):
+        seen = {'inject': None, 'submit': None}
+        with patch.object(_daemon_module, '_inject_text',
+                          side_effect=lambda t, x: seen.__setitem__('inject', x)), \
+             patch.object(_daemon_module, '_submit',
+                          side_effect=lambda t, x: seen.__setitem__('submit', x) or True), \
+             patch.object(_daemon_module.time, 'sleep'):
+            deliver = _daemon_module.make_deliver('unittestagent', 's:0')
+            deliver({'from': 'tester', 'body': 'short body'})
+        self.assertEqual(seen['inject'], '[tester@cmux]: short body')
+        self.assertEqual(seen['submit'], seen['inject'])
+
+    def test_deliver_long_message_uses_file_pointer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(_daemon_module, 'STATE_DIR', td), \
+                 patch.object(_daemon_module, '_inject_text') as inj, \
+                 patch.object(_daemon_module, '_submit', return_value=True), \
+                 patch.object(_daemon_module.time, 'sleep'):
+                deliver = _daemon_module.make_deliver('longagent', 's:0')
+                deliver({'from': 'tester', 'body': 'x' * 400})
+            text = inj.call_args[0][1]
+            self.assertTrue(text.startswith('[cmux]: @'))
+            path = text.split('@', 1)[1]
+            self.assertIn('longagent', path)
