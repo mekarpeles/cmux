@@ -478,11 +478,23 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         daemon_args.append('--no-inject')
     if unblock:
         daemon_args.append('--unblock')
+    # The daemon must not inherit the caller's cwd as an import root. `python -m`
+    # puts the cwd on sys.path, so any directory there whose name collides with a
+    # daemon import shadows the real module — e.g. running `cmux up` from a dir
+    # containing a bare `claudio/` folder makes `import claudio` resolve to that
+    # empty namespace package, and the daemon dies with
+    # `AttributeError: module 'claudio' has no attribute 'run'`.
+    #   PYTHONSAFEPATH drops the cwd entry outright, but only on Python 3.11+.
+    #   cwd=home covers 3.9/3.10, where it's silently ignored: the agent's state
+    #   dir holds no importable packages. The daemon uses no relative paths.
+    daemon_env = dict(os.environ, PYTHONSAFEPATH='1')
     daemon_proc = subprocess.Popen(
         daemon_args,
         stdout=open(daemon_log, 'w'),
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        cwd=home,
+        env=daemon_env,
     )
 
     reg[name] = {
