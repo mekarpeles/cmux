@@ -49,6 +49,28 @@ def _wait_socket(path, timeout=10):
     return False
 
 
+def _wait_pane(target, needle, timeout=20):
+    """Poll a tmux pane until `needle` shows up. Returns the last capture.
+
+    Delivery is not instant and its cost is not fixed: the daemon waits for an
+    idle pane, injects via bracketed paste, then presses Enter (with growing
+    waits) until it can verify the text left the input line. A queued startup
+    message is delivered first and pays that cost too. A fixed sleep here is a
+    guess that gets slower machines wrong; poll instead.
+    """
+    deadline = time.time() + timeout
+    pane = ''
+    while time.time() < deadline:
+        pane = subprocess.run(
+            ['tmux', 'capture-pane', '-t', target, '-p'],
+            capture_output=True, text=True,
+        ).stdout
+        if needle in pane:
+            return pane
+        time.sleep(0.25)
+    return pane
+
+
 def _rnd(n=4):
     """Return a short random hex string for unique agent names."""
     return os.urandom(n).hex()
@@ -135,7 +157,6 @@ class TestCmuxIntegration(_CmuxBase):
 
     def test_message_delivered_to_pane(self):
         """Message sent via cmux send appears in the fake Claude's tmux pane."""
-        # Pre-create identity.md so onboarding messages are skipped
         home = os.path.join(self.state_dir, 't8')
         os.makedirs(home, exist_ok=True)
         with open(os.path.join(home, 'identity.md'), 'w') as f:
@@ -143,14 +164,10 @@ class TestCmuxIntegration(_CmuxBase):
         self._start('t8')
         _wait_socket(os.path.join(self.state_dir, 't8', 't8.sock'))
         _cmux('send', 't8', 'test-payload-xyz', state_dir=self.state_dir)
-        # Give the daemon a moment to detect idle and deliver
-        time.sleep(2.5)
+
         reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
         target = reg['t8']['tmux_target']
-        pane = subprocess.run(
-            ['tmux', 'capture-pane', '-t', target, '-p'],
-            capture_output=True, text=True,
-        ).stdout
+        pane = _wait_pane(target, 'test-payload-xyz')
         self.assertIn('test-payload-xyz', pane)
 
     def test_workspace_agents_share_tmux_session(self):
