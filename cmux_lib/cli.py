@@ -438,14 +438,25 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         ['tmux', 'has-session', '-t', tmux_sess], capture_output=True
     ).returncode == 0
 
+    # -c pins the window to the caller's cwd. Without it, tmux windows inherit
+    # the SESSION's start directory — so an agent added to a long-lived
+    # workspace starts wherever the workspace was first created, not where
+    # `cmux up` was run. The cwd also determines which Claude Code project the
+    # agent belongs to (session detection + --resume are per-directory).
     if not sess_exists:
         subprocess.run(
-            ['tmux', 'new-session', '-d', '-s', tmux_sess, '-n', name, claude_cmd],
+            ['tmux', 'new-session', '-d', '-s', tmux_sess, '-n', name,
+             '-c', os.getcwd(), claude_cmd],
             check=True
         )
     else:
         subprocess.run(
-            ['tmux', 'new-window', '-t', tmux_sess, '-n', name, claude_cmd],
+            # Trailing colon forces session resolution: a bare name can match a
+            # WINDOW of the same name (e.g. the coordinator window named after
+            # its workspace), making tmux try to create at that occupied index
+            # ("create window failed: index 0 in use").
+            ['tmux', 'new-window', '-t', f'{tmux_sess}:', '-n', name,
+             '-c', os.getcwd(), claude_cmd],
             check=True
         )
 

@@ -1462,6 +1462,80 @@ class TestAllowedTools(_CmuxBase):
         self.assertIn('--allowedTools', claude_cmd_arg)
         self.assertIn('Bash,Read', claude_cmd_arg)
 
+    def _start_mocked(self, name, sess_exists):
+        """Run cmd_start with tmux/daemon mocked out; return the captured argv lists."""
+        from unittest.mock import patch as _patch, MagicMock
+        import cmux_lib.cli as _cli
+
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, 'identity.md'), 'w') as f:
+            f.write('test')
+
+        tmux_calls = []
+
+        def fake_run(args, **kwargs):
+            r = MagicMock()
+            # has-session decides which branch cmd_start takes.
+            if 'has-session' in args:
+                r.returncode = 0 if sess_exists else 1
+            else:
+                r.returncode = 0
+            # list-windows must report the window, or cmd_start's liveness
+            # check concludes claude died and exits.
+            r.stdout = f'{name}\n'
+            tmux_calls.append(list(args))
+            return r
+
+        def fake_popen(args, **kwargs):
+            m = MagicMock()
+            m.pid = 99999
+            return m
+
+        orig_state = _cli.STATE_DIR
+        _cli.STATE_DIR = self.state_dir
+        try:
+            with _patch('cmux_lib.cli.subprocess.run', side_effect=fake_run), \
+                 _patch('cmux_lib.cli.subprocess.Popen', side_effect=fake_popen), \
+                 _patch('cmux_lib.cli._wait_for_socket'), \
+                 _patch('cmux_lib.cli._inject_startup_context'), \
+                 _patch('cmux_lib.cli._store_session_id'), \
+                 _patch('cmux_lib.cli.cmd_attach'), \
+                 _patch('cmux_lib.cli.save_registry'), \
+                 _patch('cmux_lib.cli.load_registry', return_value={}):
+                _cli.cmd_start(name, detach=True, workspace=None, no_inject=False)
+        finally:
+            _cli.STATE_DIR = orig_state
+        return tmux_calls
+
+    def test_new_session_pinned_to_caller_cwd(self):
+        """tmux new-session gets -c <caller cwd>, so the agent starts where cmux up ran."""
+        calls = self._start_mocked(f'cw{_rnd()}', sess_exists=False)
+        new_sess = [c for c in calls if 'new-session' in c]
+        self.assertTrue(new_sess, 'expected a tmux new-session call')
+        self.assertIn('-c', new_sess[0])
+        self.assertEqual(new_sess[0][new_sess[0].index('-c') + 1], os.getcwd())
+
+    def test_new_window_pinned_to_caller_cwd(self):
+        """A window added to an existing session gets -c too, not the session's stale start-dir."""
+        calls = self._start_mocked(f'cw{_rnd()}', sess_exists=True)
+        new_win = [c for c in calls if 'new-window' in c]
+        self.assertTrue(new_win, 'expected a tmux new-window call')
+        self.assertIn('-c', new_win[0])
+        self.assertEqual(new_win[0][new_win[0].index('-c') + 1], os.getcwd())
+
+    def test_new_window_target_forces_session_resolution(self):
+        """new-window -t uses a trailing colon so a same-named WINDOW can't win the lookup."""
+        name = f'cw{_rnd()}'
+        calls = self._start_mocked(name, sess_exists=True)
+        new_win = [c for c in calls if 'new-window' in c]
+        self.assertTrue(new_win, 'expected a tmux new-window call')
+        target = new_win[0][new_win[0].index('-t') + 1]
+        self.assertTrue(
+            target.endswith(':'),
+            f'new-window target {target!r} must end with ":" to force session resolution'
+        )
+
     def test_allowed_tools_inherited_from_db_on_restart(self):
         """Registered allowed_tools are picked up on cmux up without re-specifying the flag."""
         name = f'at{_rnd()}'
