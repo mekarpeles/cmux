@@ -76,6 +76,16 @@ git clone --depth=1 "https://github.com/mekarpeles/cmux.git" "$CMUX_TMP/cmux"
 pipx install "$CMUX_TMP/cmux"
 rm -rf "$CMUX_TMP"
 
+# ── cq ────────────────────────────────────────────────────────────────────────
+# Per-agent issue tracker. cmux agents rely on `cq issue list`/`cq issue create`
+# for task tracking (see README's "Task tracking" section) — without it, every
+# agent home dir is missing its queue and `cq` commands fail with "not found".
+echo "cmux: installing cq..."
+CQ_TMP="$(mktemp -d)"
+git clone --depth=1 "https://github.com/mekarpeles/cq.git" "$CQ_TMP/cq"
+pipx install "$CQ_TMP/cq"
+rm -rf "$CQ_TMP"
+
 echo ""
 echo "cmux installed. You may need to restart your shell or run:"
 echo "  source ~/.bashrc  (Linux)"
