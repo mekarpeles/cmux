@@ -22,7 +22,7 @@ FAKE_CLAUDE = os.path.join(os.path.dirname(__file__), 'fake_claude.py')
 CMUX = 'cmux'
 
 
-def _cmux(*args, state_dir, check=True):
+def _cmux(*args, state_dir, check=True, cwd=None):
     env = os.environ.copy()
     env['CMUX_STATE_DIR'] = state_dir
     env['CMUX_CLAUDE_CMD'] = f'{sys.executable} {FAKE_CLAUDE}'
@@ -32,7 +32,7 @@ def _cmux(*args, state_dir, check=True):
     return subprocess.run(
         [CMUX, *args],
         capture_output=True, text=True, env=env,
-        check=check,
+        check=check, cwd=cwd,
     )
 
 
@@ -123,6 +123,32 @@ class TestCmuxIntegration(_CmuxBase):
         sock = os.path.join(self.state_dir, 't2', 't2.sock')
         ready = _wait_socket(sock, timeout=10)
         self.assertTrue(ready, "daemon socket never became ready")
+
+    def test_daemon_survives_shadowing_cwd(self):
+        """Daemon starts even when the caller's cwd shadows one of its imports.
+
+        `python -m` puts the cwd on sys.path, so a bare `claudio/` directory in
+        the cwd (no __init__.py) would otherwise win the import as a namespace
+        package and kill the daemon with
+        `AttributeError: module 'claudio' has no attribute 'run'`.
+        """
+        shadow_cwd = tempfile.mkdtemp(prefix='cmux-shadow-')
+        self.addCleanup(shutil.rmtree, shadow_cwd, True)
+        os.mkdir(os.path.join(shadow_cwd, 'claudio'))  # decoy namespace package
+
+        r = _cmux('start', 't9', '-d', state_dir=self.state_dir,
+                  cwd=shadow_cwd, check=False)
+        self._started.append('t9')
+        sock = os.path.join(self.state_dir, 't9', 't9.sock')
+        ready = _wait_socket(sock, timeout=10)
+
+        log = os.path.join(self.state_dir, 't9.daemon.log')
+        err = open(log).read().strip() if os.path.exists(log) else '(no daemon log)'
+        self.assertTrue(
+            ready,
+            f'daemon died when cwd shadowed one of its imports '
+            f'(cmux start rc={r.returncode}); daemon log:\n{err}'
+        )
 
     def test_ls_shows_agent(self):
         self._start('t3')
