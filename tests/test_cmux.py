@@ -54,6 +54,37 @@ def _rnd(n=4):
     return os.urandom(n).hex()
 
 
+# ------------------------------------------------------------------
+# Isolated tmux server for the whole test run.
+#
+# Without this, every `tmux new-session` a test spawns lands on the same
+# default tmux server Mek's real PAM agents (lupin, fran, ...) run on — a
+# crashed test or a name collision could touch a live agent's window.
+# Setting TMUX_TMPDIR before any test runs redirects tmux's socket directory
+# for this process and everything it spawns (the `cmux` CLI subprocess, and
+# in turn the daemon subprocess it launches, all inherit os.environ), so the
+# whole suite talks to a private tmux server that touches nothing real.
+# tearDownModule kills that one server — a single point of cleanup that
+# doesn't depend on any individual test's teardown succeeding.
+# ------------------------------------------------------------------
+_TMUX_TMPDIR = None
+
+
+def setUpModule():
+    global _TMUX_TMPDIR
+    _TMUX_TMPDIR = tempfile.mkdtemp(prefix='cmux-test-tmux-')
+    os.environ['TMUX_TMPDIR'] = _TMUX_TMPDIR
+
+
+def tearDownModule():
+    global _TMUX_TMPDIR
+    subprocess.run(['tmux', 'kill-server'], capture_output=True)
+    os.environ.pop('TMUX_TMPDIR', None)
+    if _TMUX_TMPDIR:
+        shutil.rmtree(_TMUX_TMPDIR, ignore_errors=True)
+    _TMUX_TMPDIR = None
+
+
 class _CmuxBase(unittest.TestCase):
     """Base class with setUp/tearDown/helpers. Contains no test methods."""
 
@@ -64,19 +95,17 @@ class _CmuxBase(unittest.TestCase):
     def tearDown(self):
         for name in self._started:
             _cmux('stop', name, state_dir=self.state_dir, check=False)
-        subprocess.run(
-            ['tmux', 'kill-session', '-t', f'cmux-test-{os.getpid()}'],
-            capture_output=True,
-        )
+        shutil.rmtree(self.state_dir, ignore_errors=True)
 
     def _start(self, name, *extra, workspace=None):
+        # Track before starting: if `cmux start` itself raises (check=True),
+        # a partially-created tmux window/daemon must still get cleaned up.
+        self._started.append(name)
         args = []
         if workspace:
             args += ['-s', workspace]
         args += ['start', name, '-d', *extra]
-        r = _cmux(*args, state_dir=self.state_dir)
-        self._started.append(name)
-        return r
+        return _cmux(*args, state_dir=self.state_dir)
 
 
 class TestCmuxIntegration(_CmuxBase):
@@ -143,14 +172,21 @@ class TestCmuxIntegration(_CmuxBase):
         self._start('t8')
         _wait_socket(os.path.join(self.state_dir, 't8', 't8.sock'))
         _cmux('send', 't8', 'test-payload-xyz', state_dir=self.state_dir)
-        # Give the daemon a moment to detect idle and deliver
-        time.sleep(2.5)
         reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
         target = reg['t8']['tmux_target']
-        pane = subprocess.run(
-            ['tmux', 'capture-pane', '-t', target, '-p'],
-            capture_output=True, text=True,
-        ).stdout
+        # Poll instead of a fixed sleep — verified delivery (paste + retry-until-
+        # submitted, see daemon.py:_submit) has variable latency, and the startup
+        # onboarding message must clear the queue before this one is even popped.
+        deadline = time.time() + 15
+        pane = ''
+        while time.time() < deadline:
+            pane = subprocess.run(
+                ['tmux', 'capture-pane', '-t', target, '-p'],
+                capture_output=True, text=True,
+            ).stdout
+            if 'test-payload-xyz' in pane:
+                break
+            time.sleep(0.3)
         self.assertIn('test-payload-xyz', pane)
 
     def test_workspace_agents_share_tmux_session(self):
