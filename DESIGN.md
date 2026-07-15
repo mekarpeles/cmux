@@ -60,9 +60,11 @@ Task tracking has moved to `cq` (per-agent issue tracker). The `tasks` table rem
 cmux send alice "msg"
   → Unix socket → daemon (claudio.run loop)
     → waits for is_idle()
-      → tmux send-keys (normal mode)
+      → bracketed paste + verified Enter-until-submitted (normal mode)
       → appends to inbox.jsonl (--no-inject mode)
 ```
+
+**Verified delivery** (`daemon.py:_inject_text` / `_submit`): plain `tmux send-keys` delivers a message as one instantaneous key burst. Claude Code's paste-detection heuristic sees the burst, enters paste-capture, and an Enter sent right after is often swallowed INTO the paste as a newline instead of submitting — the message sits unsubmitted in the input box (the long-standing "stuck message"/garbled-delivery bug). `_inject_text` loads the message into a tmux buffer and injects it with `paste-buffer -p` (bracketed paste), so the TUI knows unambiguously where the paste ends and a subsequent Enter is a real keypress. `_submit` then presses Enter and re-checks the pane (`_submitted`) with growing backoff, retrying up to `_SUBMIT_RETRIES` (5) times; if the text still hasn't left the input line after all retries, delivery is not silently dropped — cmux prints a loud `DELIVERY STUCK` line to the daemon log with the undelivered text preserved on-screen.
 
 **`is_idle()` — three checks** (in `daemon.py:make_is_idle`):
 1. `❯` prompt visible in pane content (Claude is waiting, not generating)
@@ -84,18 +86,19 @@ Two limits apply to `cmux send`:
 | Hard limit | 2000 chars | `cmd_send()` — rejects before socket | Error + `sys.exit(1)` |
 | Paste-detection soft limit | ~400 chars | Claude Code TUI behavior | Shows `[paste N lines]` instead of content |
 
-The paste-detection threshold is empirical, not a hard tmux limit. Claude Code's TUI detects large text blocks as paste events. The threshold can shift across Claude Code versions.
+The paste-detection threshold is empirical, not a hard tmux limit — it predates bracketed-paste delivery. With `_inject_text` (see above), a large body no longer risks the `[paste N lines]` heuristic; the 300-char redirect to an `@file` pointer is now kept mainly so huge bodies don't bloat the input line, and the written `msg-*.md` file doubles as an on-disk delivery record.
 
-For messages over ~400 chars, use the **file-based pattern**: write content to a state file, send a short notification pointer via `cmux send`.
+For messages over ~300 chars, use the **file-based pattern**: write content to a state file, send a short notification pointer via `cmux send`.
 
 **Known fragility in the delivery pipeline:**
 
-- `sanitize()` collapses all whitespace (including `\n`, `\t`) to a single space — multi-line messages arrive flat. This is intentional (`\n` in `send-keys` = Enter keystroke), but callers must know their formatting is stripped.
-- No retry logic anywhere — `cmd_send()` makes one socket connection attempt; failure is immediate exit.
+- `sanitize()` collapses all whitespace (including `\n`, `\t`) to a single space — multi-line messages arrive flat. This is intentional (`\n` would otherwise submit early), but callers must know their formatting is stripped.
+- No retry logic in `cmd_send()` itself — one socket connection attempt; failure is immediate exit. (Delivery *after* the message is queued does retry — see verified delivery above.)
 - `is_idle()` polling interval is controlled by claudio, not configurable from cmux.
 - If Claude Code is updated and changes its prompt character or ghost-hint format, `is_idle()` breaks silently — the three checks (`❯` visible, `cursor_x ≤ 2`, no text after `❯`) are all heuristic.
 - A human scrolling or typing in an attached pane can delay or prevent message delivery (cursor position check fires false).
 - Daemon process death leaves a stale PID file — `_check_singleton()` in `daemon.py` handles this on next start, but messages queued during the gap are lost.
+- Verified delivery adds latency, not just reliability: worst case (all 5 `_submit` retries) is ~4-5s per message before cmux gives up and logs `DELIVERY STUCK`. A queue of several messages arriving in a burst is delivered strictly one at a time (`claudio`'s `delivery_loop` blocks inside `deliver()` until it returns), so the last message in a burst can take noticeably longer to land than the first.
 
 ---
 
