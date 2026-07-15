@@ -12,7 +12,7 @@ Requires [Claude Code](https://claude.ai/code) to already be installed and authe
 curl -fsSL https://raw.githubusercontent.com/mekarpeles/cmux/main/install.sh | bash
 ```
 
-The install script also handles tmux and pipx on macOS (Homebrew) and Ubuntu/Debian.
+The install script also handles tmux, pipx, and [cq](https://github.com/mekarpeles/cq) (the per-agent task queue used below) on macOS (Homebrew) and Ubuntu/Debian.
 
 ## How it works
 
