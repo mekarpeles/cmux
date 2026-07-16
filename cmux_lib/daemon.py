@@ -283,7 +283,8 @@ def make_deliver_file(name: str):
     return deliver
 
 
-def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
+def _unblock_watcher(name: str, target: str, interval: float = 1.5,
+                      stop_event: 'threading.Event | None' = None) -> None:
     """Background thread: poll for permission prompts and auto-dismiss.
 
     Four prompt types, four responses:
@@ -293,6 +294,10 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
       then verify the dialog actually cleared before notifying. Escape would
       hit "Esc to cancel" and quit Claude, killing the window.
     - Tool-use prompts: send Escape to dismiss
+
+    stop_event is None for the real daemon (runs for the process lifetime, same
+    as always). Tests pass a real Event so the thread they spawn actually exits
+    at teardown instead of leaking as a zombie poller for the rest of the suite.
     """
     notify_msg = (
         '[claudio@noreply]: A permission prompt was detected and automatically '
@@ -326,7 +331,7 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5) -> None:
         _inject_text(target, notify_msg)
         _submit(target, notify_msg)
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
         time.sleep(interval)
         result = subprocess.run(
             ['tmux', 'capture-pane', '-t', target, '-p', '-S', '-15'],
