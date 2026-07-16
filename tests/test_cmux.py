@@ -458,6 +458,55 @@ class TestUpgradeTesting(unittest.TestCase):
 
 
 # ------------------------------------------------------------------
+# Unit tests for `cmux -f <claude-session-id> <agent>` CLI parsing
+# ------------------------------------------------------------------
+
+class TestPromoteSessionFlagParsing(unittest.TestCase):
+    """`-f <claude-session-id>` promotes an existing (externally-started) Claude
+    session into a cmux-managed agent by resuming it instead of starting fresh."""
+
+    def test_dash_f_flag_parsed_before_name(self):
+        with patch.object(_cli_module, 'cmd_start') as mock_start, \
+             patch.object(sys, 'argv', ['cmux', '-f', 'abc-123', 'myagent', '-d']):
+            _cli_module.main()
+        mock_start.assert_called_once()
+        args, kwargs = mock_start.call_args
+        self.assertEqual(args[0], 'myagent')
+        self.assertEqual(kwargs.get('from_session'), 'abc-123')
+
+    def test_dash_f_combines_with_dash_s_workspace_either_order(self):
+        with patch.object(_cli_module, 'cmd_start') as mock_start, \
+             patch.object(sys, 'argv', ['cmux', '-f', 'abc-123', '-s', 'ol-loop', 'myagent', '-d']):
+            _cli_module.main()
+        _, kwargs = mock_start.call_args
+        self.assertEqual(kwargs.get('from_session'), 'abc-123')
+        self.assertEqual(kwargs.get('workspace'), 'ol-loop')
+
+        mock_start.reset_mock()
+        with patch.object(_cli_module, 'cmd_start') as mock_start2, \
+             patch.object(sys, 'argv', ['cmux', '-s', 'ol-loop', '-f', 'abc-123', 'myagent', '-d']):
+            _cli_module.main()
+        _, kwargs2 = mock_start2.call_args
+        self.assertEqual(kwargs2.get('from_session'), 'abc-123')
+        self.assertEqual(kwargs2.get('workspace'), 'ol-loop')
+
+    def test_dash_f_with_explicit_up_subcommand(self):
+        with patch.object(_cli_module, 'cmd_start') as mock_start, \
+             patch.object(sys, 'argv', ['cmux', '-f', 'abc-123', 'up', 'myagent', '-d']):
+            _cli_module.main()
+        args, kwargs = mock_start.call_args
+        self.assertEqual(args[0], 'myagent')
+        self.assertEqual(kwargs.get('from_session'), 'abc-123')
+
+    def test_no_dash_f_leaves_from_session_none(self):
+        with patch.object(_cli_module, 'cmd_start') as mock_start, \
+             patch.object(sys, 'argv', ['cmux', 'myagent', '-d']):
+            _cli_module.main()
+        _, kwargs = mock_start.call_args
+        self.assertIsNone(kwargs.get('from_session'))
+
+
+# ------------------------------------------------------------------
 # Unit tests for sanitize() in daemon.py
 # ------------------------------------------------------------------
 
@@ -1273,6 +1322,77 @@ class TestSessionContinuity(_CmuxBase):
         if os.path.exists(sid_path):
             self.assertNotEqual(open(sid_path).read().strip(), stale_id,
                                 'stale last-session-id should have been cleared')
+
+    def test_from_session_flag_resumes_claude_with_given_id(self):
+        """cmd_start(from_session=...) passes --resume <id> to the tmux claude
+        invocation and persists it as last-session-id, so a bare `claude`
+        session can be promoted into a cmux-managed agent."""
+        from unittest.mock import patch as _patch, MagicMock
+        import cmux_lib.cli as _cli
+
+        name = f'ps{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, 'identity.md'), 'w') as f:
+            f.write('test')
+
+        tmux_calls = []
+
+        def fake_run(args, **kwargs):
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = f'{name}\n'
+            tmux_calls.append(list(args))
+            return r
+
+        def fake_popen(args, **kwargs):
+            m = MagicMock()
+            m.pid = 99999
+            return m
+
+        orig_state = _cli.STATE_DIR
+        _cli.STATE_DIR = self.state_dir
+        try:
+            with _patch('cmux_lib.cli.subprocess.run', side_effect=fake_run), \
+                 _patch('cmux_lib.cli.subprocess.Popen', side_effect=fake_popen), \
+                 _patch('cmux_lib.cli._wait_for_socket'), \
+                 _patch('cmux_lib.cli._inject_startup_context'), \
+                 _patch('cmux_lib.cli._store_session_id'), \
+                 _patch('cmux_lib.cli.cmd_attach'), \
+                 _patch('cmux_lib.cli.save_registry'), \
+                 _patch('cmux_lib.cli.load_registry', return_value={}), \
+                 _patch('cmux_lib.cli._claude_session_exists', return_value=True):
+                _cli.cmd_start(name, detach=True, workspace=None, no_inject=False,
+                               from_session='promoted-session-id')
+        finally:
+            _cli.STATE_DIR = orig_state
+
+        new_sess_calls = [c for c in tmux_calls if 'new-session' in c or 'new-window' in c]
+        self.assertTrue(new_sess_calls, 'expected a tmux new-session or new-window call')
+        claude_cmd_arg = ' '.join(new_sess_calls[0])
+        self.assertIn('--resume promoted-session-id', claude_cmd_arg)
+
+        with open(os.path.join(home, 'last-session-id')) as f:
+            self.assertEqual(f.read().strip(), 'promoted-session-id')
+
+    def test_from_session_unknown_id_exits_nonzero(self):
+        """cmd_start(from_session=<unknown>) refuses to start rather than handing
+        claude a --resume <missing-id> that would exit immediately."""
+        from unittest.mock import patch as _patch
+        import cmux_lib.cli as _cli
+
+        name = f'ps{_rnd()}'
+        orig_state = _cli.STATE_DIR
+        _cli.STATE_DIR = self.state_dir
+        try:
+            with _patch('cmux_lib.cli._claude_session_exists', return_value=False), \
+                 _patch('cmux_lib.cli.load_registry', return_value={}):
+                with self.assertRaises(SystemExit) as cm:
+                    _cli.cmd_start(name, detach=True, workspace=None, no_inject=False,
+                                   from_session='nonexistent-id')
+        finally:
+            _cli.STATE_DIR = orig_state
+        self.assertEqual(cm.exception.code, 1)
 
     def test_startup_context_wakeup_when_identity_exists(self):
         """_inject_startup_context sends a one-line wakeup when identity.md exists."""
