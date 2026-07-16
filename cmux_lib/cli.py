@@ -125,6 +125,25 @@ def session_alive(info):
     return _window_exists(tmux_sess, window)
 
 
+def _ensure_alive(name):
+    """Return the current registry, transparently recreating name's tmux
+    session/window first if it's known but gone (e.g. a reboot wiped the tmux
+    server while sessions.json/agents.db survived on disk).
+
+    Recreation goes through cmd_start, which reads workspace/etc. from
+    agents.db — so a workspaced agent rejoins its workspace session and a
+    standalone agent gets its own session back, whichever applies.
+    """
+    reg = load_registry()
+    if name in reg and session_alive(reg[name]):
+        return reg
+    if name not in reg and not db.get_agent(name):
+        return reg
+    print(f"cmux: tmux session for '{name}' not found — recreating...")
+    cmd_start(name, detach=True)
+    return load_registry()
+
+
 # ------------------------------------------------------------------
 # Commands
 # ------------------------------------------------------------------
@@ -700,7 +719,7 @@ def cmd_ls():
 
 def cmd_send(name, message, sender=None, quiet=False):
     """Enqueue a message to a named session."""
-    reg = load_registry()
+    reg = _ensure_alive(name)
     if name not in reg:
         print(f"cmux: no session '{name}'", file=sys.stderr)
         sys.exit(1)
@@ -737,7 +756,7 @@ def cmd_send(name, message, sender=None, quiet=False):
 
 def cmd_attach(name):
     """Attach to the tmux session containing this agent. Detach with Ctrl-b d."""
-    reg = load_registry()
+    reg = _ensure_alive(name)
     if name not in reg:
         print(f"cmux: no session '{name}'", file=sys.stderr)
         sys.exit(1)

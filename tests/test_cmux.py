@@ -643,6 +643,54 @@ class TestWorkspaceRestart(_CmuxBase):
 
 
 # ------------------------------------------------------------------
+# Self-heal: attach/send recreate a dead tmux session (e.g. after a reboot
+# wipes the tmux server but sessions.json/agents.db survive on disk).
+# ------------------------------------------------------------------
+
+class TestSelfHeal(_CmuxBase):
+
+    def _kill_tmux_session(self, name):
+        reg = json.load(open(os.path.join(self.state_dir, 'sessions.json')))
+        tmux_sess = reg[name]['tmux_session']
+        subprocess.run(['tmux', 'kill-session', '-t', tmux_sess], capture_output=True)
+        self.assertNotEqual(
+            subprocess.run(['tmux', 'has-session', '-t', tmux_sess], capture_output=True).returncode,
+            0,
+            'tmux session should be gone before self-heal is exercised',
+        )
+        return tmux_sess
+
+    def test_send_recreates_dead_tmux_session(self):
+        """cmux send transparently recreates the tmux session if it's gone."""
+        name = f'sh{_rnd()}'
+        self._start(name)
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
+        tmux_sess = self._kill_tmux_session(name)
+
+        r = _cmux('send', name, 'hello after reboot', state_dir=self.state_dir, check=False)
+        self.assertEqual(r.returncode, 0, f'stdout={r.stdout!r} stderr={r.stderr!r}')
+        self.assertIn('queued', r.stdout)
+
+        r2 = subprocess.run(['tmux', 'has-session', '-t', tmux_sess], capture_output=True)
+        self.assertEqual(r2.returncode, 0, 'tmux session should have been recreated')
+
+    def test_attach_recreates_dead_tmux_session(self):
+        """cmux attach recreates the tmux session before exec'ing into tmux attach."""
+        name = f'ah{_rnd()}'
+        self._start(name)
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
+        tmux_sess = self._kill_tmux_session(name)
+
+        # The final `tmux attach` has no controlling terminal in this test harness
+        # and may itself fail/exit nonzero — we only care that the session was
+        # recreated before that exec happened.
+        _cmux('attach', name, state_dir=self.state_dir, check=False)
+
+        r = subprocess.run(['tmux', 'has-session', '-t', tmux_sess], capture_output=True)
+        self.assertEqual(r.returncode, 0, 'tmux session should have been recreated by cmd_attach')
+
+
+# ------------------------------------------------------------------
 # Integration test for cmux agent import-sessions
 # ------------------------------------------------------------------
 
@@ -728,10 +776,15 @@ class TestUnblockWatcher(unittest.TestCase):
             return result
 
         target = 'cmux-test:test'
+        stop_event = threading.Event()
         with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
-            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05), daemon=True)
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05, stop_event), daemon=True)
             t.start()
-            self.assertTrue(escape_sent.wait(timeout=5.0), 'Escape key should have been sent')
+            try:
+                self.assertTrue(escape_sent.wait(timeout=5.0), 'Escape key should have been sent')
+            finally:
+                stop_event.set()
+                t.join(timeout=2.0)
 
     def test_watcher_injects_notification_after_escape(self):
         """After sending Escape, the internal notification message is injected."""
@@ -754,11 +807,16 @@ class TestUnblockWatcher(unittest.TestCase):
             return result
 
         target = 'cmux-notify:test'
+        stop_event = threading.Event()
         with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run), \
              patch('time.sleep', return_value=None):
-            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01), daemon=True)
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01, stop_event), daemon=True)
             t.start()
-            self.assertTrue(notification_sent.wait(timeout=5.0), 'notification should have been injected')
+            try:
+                self.assertTrue(notification_sent.wait(timeout=5.0), 'notification should have been injected')
+            finally:
+                stop_event.set()
+                t.join(timeout=2.0)
 
     def test_watcher_no_action_on_clean_pane(self):
         """No send-keys calls when pane has no permission patterns."""
@@ -779,10 +837,13 @@ class TestUnblockWatcher(unittest.TestCase):
                 send_key_calls.append(cmd_list)
             return result
 
+        stop_event = threading.Event()
         with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
-            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05), daemon=True)
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05, stop_event), daemon=True)
             t.start()
             time.sleep(0.3)  # allow ~6 poll iterations
+            stop_event.set()
+            t.join(timeout=2.0)
 
         self.assertEqual(len(send_key_calls), 0, 'no send-keys calls on a clean pane')
 
@@ -796,10 +857,9 @@ class TestUnblockWatcher(unittest.TestCase):
         keys_sent = []
         notify_sent = threading.Event()
         accepted = threading.Event()
-        # Randomized and target-filtered like the other watcher tests below —
-        # daemon threads are never explicitly stopped, so a lingering thread
-        # from an earlier test can still be calling the (now re-patched)
-        # subprocess.run mock while this test runs.
+        # Randomized target, kept even though each watcher thread is now
+        # stop_event-joined at teardown — cheap insurance against any other
+        # in-process caller of the same tmux target.
         target = f'cmux-trust-{_rnd()}:test'
 
         dialog_text = (
@@ -831,12 +891,17 @@ class TestUnblockWatcher(unittest.TestCase):
                     notify_sent.set()
             return result
 
+        stop_event = threading.Event()
         with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run), \
              patch('time.sleep', return_value=None):
-            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01), daemon=True)
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01, stop_event), daemon=True)
             t.start()
-            self.assertTrue(notify_sent.wait(timeout=5.0),
-                             'watcher should confirm the dialog cleared and notify')
+            try:
+                self.assertTrue(notify_sent.wait(timeout=5.0),
+                                 'watcher should confirm the dialog cleared and notify')
+            finally:
+                stop_event.set()
+                t.join(timeout=2.0)
 
         first_call = keys_sent[0]
         self.assertIn('1', first_call, "watcher must send '1' to accept the trust prompt")
@@ -866,14 +931,17 @@ class TestUnblockWatcher(unittest.TestCase):
                 keys_sent.append(cmd_list)
             return result
 
+        stop_event = threading.Event()
         with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run), \
              patch('time.sleep', return_value=None):
-            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01), daemon=True)
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.01, stop_event), daemon=True)
             t.start()
             # Event.wait's timeout isn't backed by the patched time.sleep, so
             # this is a real wall-clock pause letting several poll+verify
             # cycles run before we inspect what the watcher did.
             threading.Event().wait(timeout=0.3)
+            stop_event.set()
+            t.join(timeout=2.0)
 
         accept_calls = [c for c in keys_sent if c[-2:] == ['1', 'Enter']]
         notify_calls = [c for c in keys_sent if any('[claudio@noreply]' in a for a in c)]
@@ -903,10 +971,15 @@ class TestUnblockWatcher(unittest.TestCase):
                 escape_sent.set()
             return result
 
+        stop_event = threading.Event()
         with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
-            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05), daemon=True)
+            t = threading.Thread(target=_unblock_watcher, args=('test', target, 0.05, stop_event), daemon=True)
             t.start()
-            self.assertFalse(escape_sent.wait(timeout=0.5), 'Escape must never be sent on the trust dialog')
+            try:
+                self.assertFalse(escape_sent.wait(timeout=0.5), 'Escape must never be sent on the trust dialog')
+            finally:
+                stop_event.set()
+                t.join(timeout=2.0)
 
 
 class TestIsIdleOnTrustDialog(unittest.TestCase):
