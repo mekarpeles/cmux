@@ -333,8 +333,14 @@ def _inject_startup_context(name, home):
 
 
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False,
-              unblock=False, allowed_tools=None, identity_path=None):
-    """Start a new cmux session (window). Uses DB registration if available."""
+              unblock=False, allowed_tools=None, identity_path=None, from_session=None):
+    """Start a new cmux session (window). Uses DB registration if available.
+
+    from_session, when given, promotes an existing (externally-created) Claude
+    session into this agent by resuming that session id instead of starting
+    fresh — the rest of the startup procedure (tmux window, daemon, injected
+    onboarding message) runs exactly as it does for a normal first start.
+    """
     # Fall back to DB registration for any unspecified args
     reg_info = db.get_agent(name)
     if reg_info:
@@ -440,6 +446,25 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
             os.unlink(session_id_path)
         except FileNotFoundError:
             pass
+
+    # -f/--from promotes an existing Claude session (e.g. one the user started
+    # bare in a terminal) into this agent — an explicit override wins over
+    # whatever, if anything, was already tracked for this name.
+    if from_session:
+        if not _claude_session_exists(from_session):
+            print(
+                f"cmux: no Claude session found with id '{from_session}' — check the id "
+                f"and that you're in the directory it was started from",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        stored_id = from_session
+        try:
+            with open(session_id_path, 'w') as f:
+                f.write(stored_id)
+        except OSError:
+            pass
+
     env_prefix = f'CMUX_SESSION_NAME={name} CLAUDIO_STATE_DIR={home}'
     allowed_tools_flag = f' --allowedTools {allowed_tools}' if allowed_tools else ''
     if stored_id:
@@ -1051,6 +1076,9 @@ Usage:
   cmux run "<system prompt>"                Ephemeral Claude session — no home dir, no history
   cmux [-s workspace] <agent>               Bring agent up and attach (shorthand)
   cmux [-s workspace] up <agent> [-d] [--no-inject] [--unblock] [--allowed-tools <tools>] [-i <path>] [-- "initial prompt"]
+  cmux -f <claude-session-id> <agent> [-d]  Promote an existing Claude session into <agent>
+                                             (resumes that session id; run from the same cwd
+                                             it was started in — same as any --resume)
   cmux clone <source> <new-name> [-d] [--workspace <ws>] [--allowed-tools <tools>]
   cmux [-s workspace] down <agent>          Take agent offline (home dir preserved)
   cmux rm <agent>                           De-register agent from DB; home dir preserved (must be down first)
@@ -1175,15 +1203,20 @@ def main():
 
     _require_tmux()
 
-    # Parse -s <workspace> before the subcommand
+    # Parse -s <workspace> and -f <claude-session-id> before the subcommand.
+    # Either may appear first; both are optional and independent.
     workspace = None
-    if len(args) >= 2 and args[0] == '-s':
-        workspace = args[1]
+    from_session = None
+    while len(args) >= 2 and args[0] in ('-s', '-f'):
+        if args[0] == '-s':
+            workspace = args[1]
+        else:
+            from_session = args[1]
         args = args[2:]
-        if not args:
-            # `cmux -s ol-loop` with no further args → start whole workspace
-            cmd_start_workspace(workspace)
-            return
+    if workspace is not None and not args:
+        # `cmux -s ol-loop` with no further args → start whole workspace
+        cmd_start_workspace(workspace)
+        return
 
     cmd = args[0]
 
@@ -1302,7 +1335,8 @@ def main():
         cmd_start(cmd, initial_prompt=initial_prompt, detach=detach, workspace=sh_workspace,
                   no_inject=no_inject, unblock=unblock,
                   allowed_tools=sh_flags.get('allowed-tools'),
-                  identity_path=sh_flags.get('identity'))
+                  identity_path=sh_flags.get('identity'),
+                  from_session=from_session)
         return
 
     if cmd == 'start':
@@ -1330,7 +1364,8 @@ def main():
         cmd_start(name, initial_prompt=initial_prompt, detach=detach, workspace=up_workspace,
                   no_inject=no_inject, unblock=unblock,
                   allowed_tools=up_flags.get('allowed-tools'),
-                  identity_path=up_flags.get('identity'))
+                  identity_path=up_flags.get('identity'),
+                  from_session=from_session)
 
     elif cmd == 'ls':
         cmd_ls()
