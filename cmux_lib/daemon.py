@@ -236,6 +236,11 @@ _PASTE_THRESHOLD = 300
 # delivery stuck. Submission is VERIFIED, not assumed — see _submitted().
 _SUBMIT_RETRIES = 5
 
+# How many times to retry queuing the permission-dismiss notice through the
+# claudio socket before giving up and logging. Only matters in the narrow
+# startup window before claudio's socket is bound — see _unblock_watcher.
+_NOTIFY_RETRIES = 5
+
 
 def _inject_text(target: str, text: str) -> None:
     """Put text into the Claude input via tmux bracketed paste.
@@ -532,7 +537,8 @@ def _stuck_reconciler(name: str, target: str, interval: float = 5.0,
 
 
 def _unblock_watcher(name: str, target: str, interval: float = 1.5,
-                      stop_event: 'threading.Event | None' = None) -> None:
+                      stop_event: 'threading.Event | None' = None,
+                      state_dir: 'str | None' = None) -> None:
     """Background thread: poll for permission prompts and auto-dismiss.
 
     Four prompt types, four responses:
@@ -543,20 +549,54 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5,
       hit "Esc to cancel" and quit Claude, killing the window.
     - Tool-use prompts: send Escape to dismiss
 
+    The dismiss keystroke itself is sent immediately in all four cases — it's
+    a live response to whatever the CLI is showing right now and can't wait.
+    The follow-up "dismissed" notice is different: it's just informational, so
+    instead of pasting it straight into the pane (racy against anything the
+    agent, or a human, is mid-typing when the dialog clears) it's queued
+    through claudio's own inbox socket — the exact same path a normal
+    `cmux send` message takes. claudio's delivery_loop only calls deliver()
+    once is_idle() is true, so the notice waits its turn instead of landing
+    on top of in-progress input.
+
+    state_dir is the claudio agent's home dir (contains `{name}.sock`). If not
+    given — e.g. a test exercising the dismiss-key logic in isolation, with no
+    claudio agent actually running — the notice falls back to the old direct
+    inject-and-submit behavior.
+
     stop_event is None for the real daemon (runs for the process lifetime, same
     as always). Tests pass a real Event so the thread they spawn actually exits
     at teardown instead of leaking as a zombie poller for the rest of the suite.
     """
-    notify_msg = (
-        '[claudio@noreply]: A permission prompt was detected and automatically '
-        'dismissed. Continuing with normal operation.'
+    notify_body = (
+        'A permission prompt was detected and automatically dismissed. '
+        'Continuing with normal operation.'
     )
+
+    def _notify() -> None:
+        if state_dir is None:
+            legacy_msg = f'[claudio@noreply]: {notify_body}'
+            _inject_text(target, legacy_msg)
+            _submit(target, legacy_msg)
+            return
+        import claudio
+        sock_path = claudio.socket_path(name, state_dir)
+        for _attempt in range(_NOTIFY_RETRIES):
+            try:
+                claudio.send_to(sock_path, {'from': 'claudio', 'body': notify_body})
+                return
+            except OSError:
+                time.sleep(0.5)
+        print(
+            f'cmux: could not queue permission-dismiss notice for {name!r} — '
+            f'claudio socket unreachable after {_NOTIFY_RETRIES} attempts',
+            file=sys.stderr, flush=True,
+        )
 
     def _send_and_notify(key):
         subprocess.run(['tmux', 'send-keys', '-t', target, key, 'Enter'], capture_output=True)
         time.sleep(1.0)
-        _inject_text(target, notify_msg)
-        _submit(target, notify_msg)
+        _notify()
 
     def _trust_dialog_and_verify():
         """Accept the folder-trust dialog, then re-check the pane before
@@ -576,8 +616,7 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5,
             return  # window is gone — nothing left to notify
         if any(pat in result.stdout.lower() for pat in _TRUST_DIALOG_PATTERNS):
             return  # dialog still showing — leave it for the next poll
-        _inject_text(target, notify_msg)
-        _submit(target, notify_msg)
+        _notify()
 
     while stop_event is None or not stop_event.is_set():
         time.sleep(interval)
@@ -610,8 +649,7 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5,
         elif any(pat in pane_text for pat in _PERM_PATTERNS):
             subprocess.run(['tmux', 'send-keys', '-t', target, 'Escape'], capture_output=True)
             time.sleep(1.0)
-            _inject_text(target, notify_msg)
-            _submit(target, notify_msg)
+            _notify()
 
 
 def _check_singleton(name: str) -> None:
@@ -643,6 +681,8 @@ def run(name: str, tmux_target: str = None, no_inject: bool = False, unblock: bo
     _check_singleton(name)
     if tmux_target is None:
         tmux_target = f'cmux-{name}:{name}'
+    home = os.path.join(STATE_DIR, name)
+    os.makedirs(home, exist_ok=True)
     in_flight = threading.Event()
     if no_inject:
         deliver = make_deliver_file(name)
@@ -661,10 +701,13 @@ def run(name: str, tmux_target: str = None, no_inject: bool = False, unblock: bo
         # Always run the unblock watcher — catches bypass permissions confirmation
         # and other permission prompts that appear during normal operation.
         # no_inject sessions don't use send-keys so the watcher would be a no-op.
-        t = threading.Thread(target=_unblock_watcher, args=(name, tmux_target), daemon=True)
+        # state_dir lets the watcher queue its "dismissed" notice through
+        # claudio's own inbox socket instead of pasting it directly.
+        t = threading.Thread(
+            target=_unblock_watcher, args=(name, tmux_target),
+            kwargs={'state_dir': home}, daemon=True,
+        )
         t.start()
-    home = os.path.join(STATE_DIR, name)
-    os.makedirs(home, exist_ok=True)
     claudio.run(
         name=name,
         deliver=deliver,

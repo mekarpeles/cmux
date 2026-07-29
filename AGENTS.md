@@ -80,7 +80,67 @@ Every repo has isolated tests that never touch live agent state:
 - cmux: `python3 -m pytest tests/test_cmux.py -v` — uses `CMUX_STATE_DIR` temp dirs
 - cq: `python3 -m pytest tests/test_cq.py -v` — uses `CQ_STATE_DIR` / `path=` temp dirs
 
+**Run tests with the pipx venv's Python** (`/Users/mek/.local/pipx/venvs/cmux/bin/python3 -m
+pytest ...`), not a bare system `python3`. `claudio` is only installed inside that venv — under
+system Python, any test that actually imports `claudio` fails loudly (`ModuleNotFoundError`),
+but a test that only *exercises a code path that never happens to import it* passes silently
+while giving zero real coverage of that path. This bit the 2026-07-23 fixes: the entire
+`_unblock_watcher` notify-routing behavior (the part that talks to `claudio`) had no test
+actually capable of importing `claudio` until this was caught. `pytest` itself isn't in that
+venv by default — `pipx inject cmux pytest` adds it.
+
 Tests must pass before a PR is opened.
+
+### Never develop or manually test against production state
+
+**cmux is not a testing ground for itself.** On 2026-07-23, an agent manually exercised a
+new feature (`cmux -f <session-id> <agent>`, which promotes/overwrites a session id) against
+the real `ada` agent instead of an isolated throwaway name, using a session id that wasn't
+Ada's. That single command overwrote her real, days-old conversation history with an
+unrelated session — an outcome that is not recoverable from cmux's own state (the underlying
+Claude Code transcript survived by luck, not by any safety net cmux provides). Separately,
+the same incident wiped `sessions.json` to `{}` for every agent in every workspace, because a
+read failure was silently swallowed into an empty dict and then persisted back to disk.
+
+Rules, no exceptions:
+
+1. **Any manual/interactive exercising of a cmux command — not just the automated pytest
+   suite — must run against an isolated `CMUX_STATE_DIR`, never the real `~/.cmux`.**
+   ```bash
+   export CMUX_STATE_DIR=$(mktemp -d)
+   export TMUX_TMPDIR=$(mktemp -d)          # isolates the tmux server too
+   export CMUX_CLAUDE_CMD="python3 $(pwd)/tests/fake_claude.py"   # or a real claude binary
+                                                                    # if you need genuine
+                                                                    # Claude behavior, but
+                                                                    # never against a real
+                                                                    # agent name either way
+   cmux up some-throwaway-test-name -d
+   ```
+   This is the exact pattern `tests/test_cmux.py`'s `_cmux()` helper already uses — copy it
+   rather than improvising.
+2. **Never invoke a command that can overwrite or delete state (`-f`/`--from`, `rm -f`, `down`,
+   registry edits) against a real, currently-registered agent name** — not even "just to see
+   what happens" or "it's probably fine." Use a name that does not exist in the real
+   `agents.db`/`~/.cmux/`.
+3. **Confirm the installed `cmux` binary actually reflects your source changes before trusting
+   a manual test against it.** `pipx install cmux` (without `--editable`) creates a static,
+   disconnected copy of the package — editing `~/Projects/cmux/cmux_lib/*.py` afterward does
+   nothing to the installed binary until it's explicitly reinstalled. This is exactly how the
+   2026-07-23 fixes went untested against the real CLI for an entire session: `pytest` resolves
+   the local source package (masking the mismatch) while the global `cmux` command kept
+   running a stale copy. Verify with:
+   ```bash
+   python3 -c "import cmux_lib.cli; print(cmux_lib.cli.__file__)"
+   ```
+   It must print a path under `~/Projects/cmux/`, not under
+   `~/.local/pipx/venvs/cmux/lib/.../site-packages/`. If it doesn't, fix the install before
+   doing anything else:
+   ```bash
+   pipx install --editable ~/Projects/cmux --force
+   ```
+4. **This applies even when you're confident the change is small or safe.** The `-f` feature
+   above was itself new, reviewed-in-code, unit-tested code — the failure was entirely about
+   *where* it was exercised, not whether it was well-written.
 
 ### Backwards compatibility
 

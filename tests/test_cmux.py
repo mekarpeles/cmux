@@ -714,6 +714,74 @@ class TestWorkspaceRestart(_CmuxBase):
 
 
 # ------------------------------------------------------------------
+# Registry hardening: sessions.json must never be silently treated as empty
+# when it's actually corrupt (2026-07-23 incident: a transient read failure
+# was swallowed into `{}`, then written back, wiping every agent's session
+# bookkeeping in one shot), and writes must be atomic.
+# ------------------------------------------------------------------
+
+class TestRegistryCorruption(_CmuxBase):
+
+    def test_missing_registry_returns_empty_dict(self):
+        """No sessions.json at all is a normal, non-corrupt state — {}."""
+        reg_path = os.path.join(self.state_dir, 'sessions.json')
+        self.assertFalse(os.path.exists(reg_path))
+        orig_state = _cli_module.STATE_DIR
+        orig_registry = _cli_module.REGISTRY
+        _cli_module.STATE_DIR = self.state_dir
+        _cli_module.REGISTRY = reg_path
+        try:
+            self.assertEqual(_cli_module.load_registry(), {})
+        finally:
+            _cli_module.STATE_DIR = orig_state
+            _cli_module.REGISTRY = orig_registry
+
+    def test_corrupt_registry_refuses_and_backs_up_instead_of_returning_empty(self):
+        """A corrupt (but present) sessions.json must never be silently treated
+        as {} — that's exactly how the real registry got wiped on 2026-07-23:
+        a read failure was swallowed into an empty dict, which a subsequent
+        save then persisted, erasing every agent's session bookkeeping."""
+        reg_path = os.path.join(self.state_dir, 'sessions.json')
+        with open(reg_path, 'w') as f:
+            f.write('{not valid json')
+        orig_state = _cli_module.STATE_DIR
+        orig_registry = _cli_module.REGISTRY
+        _cli_module.STATE_DIR = self.state_dir
+        _cli_module.REGISTRY = reg_path
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                _cli_module.load_registry()
+            self.assertEqual(cm.exception.code, 1)
+            # Original corrupt content must still be on disk, untouched...
+            with open(reg_path) as f:
+                self.assertEqual(f.read(), '{not valid json')
+            # ...and a backup copy must exist for recovery.
+            backups = [f for f in os.listdir(self.state_dir) if f.startswith('sessions.json.corrupt-')]
+            self.assertEqual(len(backups), 1, 'expected exactly one backup of the corrupt registry')
+        finally:
+            _cli_module.STATE_DIR = orig_state
+            _cli_module.REGISTRY = orig_registry
+
+    def test_save_registry_writes_atomically_no_leftover_tmp_file(self):
+        """save_registry must not leave a partial/tmp file behind, and the
+        final file must be valid, complete JSON."""
+        reg_path = os.path.join(self.state_dir, 'sessions.json')
+        orig_state = _cli_module.STATE_DIR
+        orig_registry = _cli_module.REGISTRY
+        _cli_module.STATE_DIR = self.state_dir
+        _cli_module.REGISTRY = reg_path
+        try:
+            _cli_module.save_registry({'some-agent': {'name': 'some-agent'}})
+            with open(reg_path) as f:
+                self.assertEqual(json.load(f), {'some-agent': {'name': 'some-agent'}})
+            leftovers = [f for f in os.listdir(self.state_dir) if '.tmp-' in f]
+            self.assertEqual(leftovers, [], 'no tmp file should remain after a successful save')
+        finally:
+            _cli_module.STATE_DIR = orig_state
+            _cli_module.REGISTRY = orig_registry
+
+
+# ------------------------------------------------------------------
 # Self-heal: attach/send recreate a dead tmux session (e.g. after a reboot
 # wipes the tmux server but sessions.json/agents.db survive on disk).
 # ------------------------------------------------------------------
@@ -759,6 +827,48 @@ class TestSelfHeal(_CmuxBase):
 
         r = subprocess.run(['tmux', 'has-session', '-t', tmux_sess], capture_output=True)
         self.assertEqual(r.returncode, 0, 'tmux session should have been recreated by cmd_attach')
+
+    def test_self_heal_restart_terminates_orphaned_previous_daemon(self):
+        """Regression test for the 2026-07-23 incident: when a dead tmux
+        session is recreated (self-heal, or any restart), the PREVIOUS
+        daemon process for this agent — which the tmux kill never touched,
+        since the daemon is a separate OS process — must be terminated, not
+        silently orphaned. Orphaned daemons accumulated indefinitely in
+        production (7+ for a single agent, one dating back days), each
+        independently polling and injecting into the same tmux pane —
+        the direct cause of duplicate permission-dismiss notices."""
+        name = f'dm{_rnd()}'
+        self._start(name)
+        _wait_socket(os.path.join(self.state_dir, name, f'{name}.sock'))
+        pid_file = os.path.join(self.state_dir, f'{name}.daemon.pid')
+        old_pid = int(open(pid_file).read().strip())
+        os.kill(old_pid, 0)  # confirm alive before proceeding
+
+        self._kill_tmux_session(name)  # kills the tmux side only, daemon survives
+        os.kill(old_pid, 0)  # still alive — this is the orphan condition
+
+        # Trigger self-heal, which recreates via cmd_start.
+        r = _cmux('send', name, 'trigger self-heal', state_dir=self.state_dir, check=False)
+        self.assertEqual(r.returncode, 0, f'stdout={r.stdout!r} stderr={r.stderr!r}')
+
+        # The old daemon's original parent (the first `cmux start` CLI process)
+        # already exited by the time we get here, so it's reparented (to
+        # launchd/init) and may take a moment to actually be reaped even after
+        # a successful SIGTERM — poll rather than asserting instantaneously.
+        deadline = time.time() + 5
+        old_gone = False
+        while time.time() < deadline:
+            try:
+                os.kill(old_pid, 0)
+            except ProcessLookupError:
+                old_gone = True
+                break
+            time.sleep(0.1)
+        self.assertTrue(old_gone, 'the orphaned previous daemon should have been terminated')
+
+        new_pid = int(open(pid_file).read().strip())
+        self.assertNotEqual(new_pid, old_pid, 'a fresh daemon should be running with a new pid')
+        os.kill(new_pid, 0)  # the new daemon must be alive
 
 
 # ------------------------------------------------------------------
@@ -888,6 +998,60 @@ class TestUnblockWatcher(unittest.TestCase):
             finally:
                 stop_event.set()
                 t.join(timeout=2.0)
+
+    def test_watcher_notify_routes_through_claudio_queue_when_state_dir_given(self):
+        """Regression coverage for cq #26 / the daemon-duplication findings doc:
+        when state_dir is provided, the follow-up notify message must go
+        through claudio.send_to (which lands in claudio's own is_idle-gated
+        delivery queue) rather than being pasted directly into the pane via
+        _inject_text/_submit. Direct injection is exactly the corruption
+        pattern this was built to avoid — it can land on top of in-progress
+        typed input."""
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+        import claudio
+
+        sent_via_queue = threading.Event()
+        direct_inject_called = threading.Event()
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            cmd_list = list(cmd)
+            if 'capture-pane' in cmd_list:
+                result.stdout = 'needs permission'
+            elif 'load-buffer' in cmd_list or 'send-keys' in cmd_list:
+                # Any direct pane injection/submit attempt for the notify text
+                # would show up here — the queue-based path must never reach it.
+                if any('claudio@noreply' in str(a) for a in cmd_list) or \
+                   b'claudio@noreply' in kwargs.get('input', b''):
+                    direct_inject_called.set()
+            return result
+
+        def fake_send_to(sock_path, message):
+            sent_via_queue.set()
+            return {'ok': True}
+
+        target = 'cmux-notify-queue:test'
+        stop_event = threading.Event()
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run), \
+             patch('claudio.send_to', side_effect=fake_send_to), \
+             patch('time.sleep', return_value=None):
+            t = threading.Thread(
+                target=_unblock_watcher,
+                args=('test', target, 0.01, stop_event),
+                kwargs={'state_dir': '/tmp/fake-agent-home'},
+                daemon=True,
+            )
+            t.start()
+            try:
+                self.assertTrue(sent_via_queue.wait(timeout=5.0),
+                                'notify should have been queued via claudio.send_to')
+            finally:
+                stop_event.set()
+                t.join(timeout=2.0)
+        self.assertFalse(direct_inject_called.is_set(),
+                          'notify must not be pasted directly into the pane when state_dir is given')
 
     def test_watcher_no_action_on_clean_pane(self):
         """No send-keys calls when pane has no permission patterns."""
@@ -1720,8 +1884,188 @@ class TestSessionContinuity(_CmuxBase):
             _cli.STATE_DIR = orig_state
         self.assertEqual(cm.exception.code, 1)
 
-    def test_startup_context_wakeup_when_identity_exists(self):
-        """_inject_startup_context sends a one-line wakeup when identity.md exists."""
+    def test_from_session_refuses_to_overwrite_existing_valid_session_without_force(self):
+        """Regression test for the 2026-07-23 incident: testing -f against a
+        real agent name overwrote its actual history with an unrelated
+        session. cmd_start(from_session=...) must refuse to replace an
+        agent's existing, different, still-valid tracked session unless
+        force=True is explicitly passed."""
+        from unittest.mock import patch as _patch
+        import cmux_lib.cli as _cli
+
+        name = f'ps{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, 'last-session-id'), 'w') as f:
+            f.write('real-existing-session-id')
+
+        orig_state = _cli.STATE_DIR
+        _cli.STATE_DIR = self.state_dir
+        try:
+            with _patch('cmux_lib.cli._claude_session_exists', return_value=True), \
+                 _patch('cmux_lib.cli.load_registry', return_value={}), \
+                 _patch('cmux_lib.cli.db.get_agent', return_value={'workspace': None}):
+                with self.assertRaises(SystemExit) as cm:
+                    _cli.cmd_start(name, detach=True, workspace=None, no_inject=False,
+                                   from_session='some-other-session-id', force=False)
+            self.assertEqual(cm.exception.code, 1)
+            # The real session id must survive untouched.
+            with open(os.path.join(home, 'last-session-id')) as f:
+                self.assertEqual(f.read().strip(), 'real-existing-session-id')
+        finally:
+            _cli.STATE_DIR = orig_state
+
+    def test_from_session_with_force_overwrites_existing_session(self):
+        """force=True is the explicit escape hatch for genuinely replacing an
+        agent's tracked session with a different one."""
+        from unittest.mock import patch as _patch, MagicMock
+        import cmux_lib.cli as _cli
+
+        name = f'ps{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        with open(os.path.join(home, 'last-session-id'), 'w') as f:
+            f.write('real-existing-session-id')
+
+        def fake_run(args, **kwargs):
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = f'{name}\n'
+            return r
+
+        def fake_popen(args, **kwargs):
+            m = MagicMock()
+            m.pid = 99999
+            return m
+
+        orig_state = _cli.STATE_DIR
+        _cli.STATE_DIR = self.state_dir
+        try:
+            with _patch('cmux_lib.cli.subprocess.run', side_effect=fake_run), \
+                 _patch('cmux_lib.cli.subprocess.Popen', side_effect=fake_popen), \
+                 _patch('cmux_lib.cli._wait_for_socket'), \
+                 _patch('cmux_lib.cli._inject_startup_context'), \
+                 _patch('cmux_lib.cli._store_session_id'), \
+                 _patch('cmux_lib.cli.cmd_attach'), \
+                 _patch('cmux_lib.cli.save_registry'), \
+                 _patch('cmux_lib.cli.load_registry', return_value={}), \
+                 _patch('cmux_lib.cli.db.get_agent', return_value={'workspace': None}), \
+                 _patch('cmux_lib.cli._claude_session_exists', return_value=True):
+                _cli.cmd_start(name, detach=True, workspace=None, no_inject=False,
+                               from_session='some-other-session-id', force=True)
+        finally:
+            _cli.STATE_DIR = orig_state
+
+        with open(os.path.join(home, 'last-session-id')) as f:
+            self.assertEqual(f.read().strip(), 'some-other-session-id')
+
+    def test_first_start_persists_cwd(self):
+        """A brand-new agent's cwd (from os.getcwd() at first start) is
+        recorded to home/cwd, so later starts can reuse it regardless of
+        where `cmux up` is next invoked from."""
+        from unittest.mock import patch as _patch, MagicMock
+        import cmux_lib.cli as _cli
+
+        name = f'cw{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+
+        def fake_run(args, **kwargs):
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = f'{name}\n'
+            return r
+
+        def fake_popen(args, **kwargs):
+            m = MagicMock()
+            m.pid = 99999
+            return m
+
+        orig_state = _cli.STATE_DIR
+        _cli.STATE_DIR = self.state_dir
+        try:
+            with _patch('cmux_lib.cli.subprocess.run', side_effect=fake_run), \
+                 _patch('cmux_lib.cli.subprocess.Popen', side_effect=fake_popen), \
+                 _patch('cmux_lib.cli._wait_for_socket'), \
+                 _patch('cmux_lib.cli._inject_startup_context'), \
+                 _patch('cmux_lib.cli._store_session_id'), \
+                 _patch('cmux_lib.cli.cmd_attach'), \
+                 _patch('cmux_lib.cli.save_registry'), \
+                 _patch('cmux_lib.cli.load_registry', return_value={}):
+                _cli.cmd_start(name, detach=True, workspace=None, no_inject=False)
+        finally:
+            _cli.STATE_DIR = orig_state
+
+        with open(os.path.join(home, 'cwd')) as f:
+            self.assertEqual(f.read().strip(), os.getcwd())
+
+    def test_resume_uses_stored_cwd_not_invokers_cwd(self):
+        """Once a cwd is recorded, a later start from a DIFFERENT directory
+        must still launch the tmux window in the agent's own stored
+        directory — not wherever `cmux up` happens to be run from. This is
+        the direct fix for the 2026-07-23 incident: every agent was being
+        resumed from the wrong directory, which silently started an
+        unrelated fresh conversation instead of the real one."""
+        from unittest.mock import patch as _patch, MagicMock
+        import cmux_lib.cli as _cli
+
+        name = f'cw{_rnd()}'
+        home = os.path.join(self.state_dir, name)
+        os.makedirs(home, exist_ok=True)
+        real_agent_dir = tempfile.mkdtemp(prefix='cmux-agent-realdir-')
+        with open(os.path.join(home, 'cwd'), 'w') as f:
+            f.write(real_agent_dir)
+        with open(os.path.join(home, 'last-session-id'), 'w') as f:
+            f.write('resume-me')
+
+        tmux_calls = []
+
+        def fake_run(args, **kwargs):
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = f'{name}\n'
+            tmux_calls.append(list(args))
+            return r
+
+        def fake_popen(args, **kwargs):
+            m = MagicMock()
+            m.pid = 99999
+            return m
+
+        orig_state = _cli.STATE_DIR
+        _cli.STATE_DIR = self.state_dir
+        # Simulate invoking `cmux up` from a totally different directory.
+        wrong_invoker_dir = tempfile.mkdtemp(prefix='cmux-invoker-wrongdir-')
+        with _patch('cmux_lib.cli.os.getcwd', return_value=wrong_invoker_dir):
+            try:
+                with _patch('cmux_lib.cli.subprocess.run', side_effect=fake_run), \
+                     _patch('cmux_lib.cli.subprocess.Popen', side_effect=fake_popen), \
+                     _patch('cmux_lib.cli._wait_for_socket'), \
+                     _patch('cmux_lib.cli._inject_startup_context'), \
+                     _patch('cmux_lib.cli._store_session_id') as mock_store, \
+                     _patch('cmux_lib.cli.cmd_attach'), \
+                     _patch('cmux_lib.cli.save_registry'), \
+                     _patch('cmux_lib.cli.load_registry', return_value={}), \
+                     _patch('cmux_lib.cli.db.get_agent', return_value={'workspace': None}), \
+                     _patch('cmux_lib.cli._claude_session_exists', return_value=True):
+                    _cli.cmd_start(name, detach=True, workspace=None, no_inject=False)
+                    # Resuming a known session must never re-run the diff-based
+                    # auto-detect — that's the exact mechanism that clobbered
+                    # last-session-id with unrelated sessions on 2026-07-23.
+                    mock_store.assert_not_called()
+            finally:
+                _cli.STATE_DIR = orig_state
+
+        new_sess_calls = [c for c in tmux_calls if 'new-session' in c or 'new-window' in c]
+        self.assertTrue(new_sess_calls, 'expected a tmux new-session or new-window call')
+        self.assertIn(real_agent_dir, new_sess_calls[0], 'tmux window must launch in the stored agent dir')
+        self.assertNotIn(wrong_invoker_dir, new_sess_calls[0])
+
+        # The stored cwd must be unchanged after a resume.
+        with open(os.path.join(home, 'cwd')) as f:
+            self.assertEqual(f.read().strip(), real_agent_dir)
+
+    def test_startup_context_resume_wakeup_when_identity_exists(self):
+        """On a resume (is_first_start=False), sends a one-line wakeup referencing identity.md when it exists."""
         from unittest.mock import patch as _patch
         home = tempfile.mkdtemp(prefix='cmux-id-test-')
         name = os.path.basename(home)
@@ -1730,7 +2074,7 @@ class TestSessionContinuity(_CmuxBase):
             with open(identity_path, 'w') as f:
                 f.write('I am an agent.')
             with _patch('cmux_lib.cli.cmd_send') as mock_send:
-                _cli_module_for_session._inject_startup_context(name, home)
+                _cli_module_for_session._inject_startup_context(name, home, False)
             mock_send.assert_called_once()
             sent_msg = mock_send.call_args[0][1]
             self.assertIn(name, sent_msg)
@@ -1738,14 +2082,34 @@ class TestSessionContinuity(_CmuxBase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
-    def test_startup_context_onboarding_when_no_identity(self):
-        """_inject_startup_context sends one message with session info + @ONBOARDING + @IDENTITY_GUIDE when identity.md is absent."""
+    def test_startup_context_resume_no_onboarding_when_no_identity(self):
+        """Regression test for the 2026-07-23 onboarding-on-resume bug: a resume
+        (is_first_start=False) must NOT get the onboarding blast just because
+        identity.md happens to be absent — several real agents never get one
+        seeded and would otherwise re-onboard on every single resume."""
         from unittest.mock import patch as _patch
         home = tempfile.mkdtemp(prefix='cmux-id-test-')
         name = os.path.basename(home)
         try:
             with _patch('cmux_lib.cli.cmd_send') as mock_send:
-                _cli_module_for_session._inject_startup_context(name, home)
+                _cli_module_for_session._inject_startup_context(name, home, False)
+            mock_send.assert_called_once()
+            msg = mock_send.call_args[0][1]
+            self.assertIn('Resuming', msg)
+            self.assertNotIn('ONBOARDING.md', msg)
+            self.assertNotIn('IDENTITY_GUIDE.md', msg)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_startup_context_onboarding_on_first_start(self):
+        """On a true first start (is_first_start=True), sends one message with
+        session info + @ONBOARDING + @IDENTITY_GUIDE, regardless of identity.md."""
+        from unittest.mock import patch as _patch
+        home = tempfile.mkdtemp(prefix='cmux-id-test-')
+        name = os.path.basename(home)
+        try:
+            with _patch('cmux_lib.cli.cmd_send') as mock_send:
+                _cli_module_for_session._inject_startup_context(name, home, True)
             self.assertEqual(mock_send.call_count, 1)
             msg = mock_send.call_args[0][1]
             self.assertIn(name, msg)
@@ -2146,7 +2510,7 @@ class TestClone(_CmuxBase):
             f.write(src)
 
         with _patch('cmux_lib.cli.cmd_send') as mock_send:
-            _cli_module_for_session._inject_startup_context(clone, clone_home)
+            _cli_module_for_session._inject_startup_context(clone, clone_home, True)
 
         mock_send.assert_called_once()
         msg = mock_send.call_args[0][1]
@@ -2171,7 +2535,7 @@ class TestClone(_CmuxBase):
             f.write(src)
 
         with _patch('cmux_lib.cli.cmd_send'):
-            _cli_module_for_session._inject_startup_context(clone, clone_home)
+            _cli_module_for_session._inject_startup_context(clone, clone_home, True)
 
         self.assertFalse(
             os.path.exists(os.path.join(clone_home, 'clone-source')),
