@@ -8,7 +8,7 @@ import sys
 import time
 
 from cmux_lib import db
-from cmux_lib.daemon import _PERM_PATTERNS, _TRUST_DIALOG_PATTERNS
+from cmux_lib.daemon import _PERM_PATTERNS, _TRUST_DIALOG_PATTERNS, _stuck_cmux_message
 
 STATE_DIR = os.environ.get('CMUX_STATE_DIR', os.path.expanduser('~/.cmux'))
 REGISTRY = os.path.join(STATE_DIR, 'sessions.json')
@@ -972,22 +972,38 @@ def cmd_check():
             ['tmux', 'capture-pane', '-t', target, '-p', '-S', '-15'],
             capture_output=True, text=True
         )
-        pane_text = r.stdout.lower() if r.returncode == 0 else ''
+        pane_raw = r.stdout if r.returncode == 0 else ''
+        pane_text = pane_raw.lower()
 
-        is_stuck = any(pat in pane_text for pat in _PERM_PATTERNS) or \
-            any(pat in pane_text for pat in _TRUST_DIALOG_PATTERNS)
-        if is_stuck:
-            stuck.append((name, target))
+        # A cmux message left unsubmitted in the input box strands the agent as
+        # effectively as a permission prompt: is_idle() reports the non-empty
+        # box as busy, so every later message queues behind it. The daemon's
+        # reconciler recovers it on its own, so this is reported separately from
+        # prompts that genuinely need a human.
+        if any(pat in pane_text for pat in _PERM_PATTERNS) or \
+                any(pat in pane_text for pat in _TRUST_DIALOG_PATTERNS):
+            stuck.append((name, target, 'prompt'))
             print(f'  [STUCK] {name:<16} — blocked, needs interaction ({target})')
+        elif _stuck_cmux_message(pane_raw) is not None:
+            stuck.append((name, target, 'unsubmitted'))
+            print(f'  [STUCK] {name:<16} — message left unsubmitted in the input box ({target})')
         else:
             ok.append(name)
             print(f'  [OK]    {name}')
 
     print()
     if stuck:
-        print(f'{len(stuck)} agent(s) blocked at permission prompt:')
-        for name, target in stuck:
-            print(f'  tmux attach -t {target}')
+        prompts = [(n, t) for n, t, kind in stuck if kind == 'prompt']
+        unsubmitted = [(n, t) for n, t, kind in stuck if kind == 'unsubmitted']
+        if prompts:
+            print(f'{len(prompts)} agent(s) blocked at permission prompt:')
+            for name, target in prompts:
+                print(f'  tmux attach -t {target}')
+        if unsubmitted:
+            print(f'{len(unsubmitted)} agent(s) with an unsubmitted message '
+                  f'(the daemon retries these automatically):')
+            for name, target in unsubmitted:
+                print(f'  tmux attach -t {target}')
     else:
         print(f'All {len(ok)} agent(s) OK.')
 

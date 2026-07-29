@@ -7,6 +7,7 @@ Delivery injects messages via tmux send-keys.
 """
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -86,21 +87,113 @@ def prompt_area(target: str) -> str:
     return '\n'.join(lines[-4:]) if len(lines) >= 4 else result.stdout
 
 
-def make_is_idle(target: str):
-    """Return True when the Claude session is idle: prompt visible, cursor at
-    start, nothing typed. Inject immediately — no timers, no hashing.
+# Dim placeholder text Claude Code paints into an EMPTY input box. Matched so
+# a placeholder is never mistaken for a draft. Anything else after ❯ is treated
+# as typed text: a delayed message is recoverable (it stays queued in claudio
+# until the box clears), a draft that got pasted over and submitted is not.
+_GHOST_HINT_PREFIXES = (
+    'try "',
+    '/ for commands',
+    '? for shortcuts',
+)
 
-    Three checks:
-    1. ❯ prompt is visible (Claude is waiting for input, not generating)
-    2. cursor_x <= 2 (cursor at the prompt position, not mid-typed-text)
-    3. No text after the ❯ ghost-hint (handles Ctrl-A: cursor moves to 0
-       but typed text is still in the buffer and visible in pane content)
+# A highlighted menu option ('❯ 1. Yes'), not a typed draft — permission and
+# folder-trust dialogs reuse the same ❯ glyph as the input prompt.
+_MENU_OPTION_RE = re.compile(r'^\d+\.\s')
+
+# Present in the status bar only while Claude is mid-turn. The input box stays
+# drawn during generation, so a visible prompt alone is not idleness.
+_GENERATING_MARKER = 'esc to interrupt'
+
+
+def _last_prompt_line(content: str) -> 'str | None':
+    """The last line starting with ❯ — Claude Code's live input box.
+
+    Scrollback above it holds echoes of previously submitted messages that also
+    start with ❯; only the last occurrence is the current input box.
+    """
+    last = None
+    for line in content.split('\n'):
+        stripped = line.lstrip()
+        if stripped.startswith('❯'):
+            last = stripped
+    return last
+
+
+def _prompt_body(prompt_line: str) -> str:
+    """Text after the ❯ glyph, with nbsp padding normalized away."""
+    return prompt_line[1:].replace('\xa0', ' ').strip()
+
+
+def _input_is_empty(prompt_line: str) -> bool:
+    """True when the input box holds nothing the user would mind losing."""
+    body = _prompt_body(prompt_line)
+    if not body:
+        return True
+    return any(body.lower().startswith(p) for p in _GHOST_HINT_PREFIXES)
+
+
+def _has_user_draft(content: str) -> bool:
+    """True when the input box holds text the user typed.
+
+    Deliberately weaker than `not _input_is_empty(...)`: a dialog's highlighted
+    option ('❯ 1. Yes') is not a draft, and the unblock watcher must still be
+    able to answer it.
+    """
+    prompt_line = _last_prompt_line(content)
+    if prompt_line is None:
+        return False
+    if _input_is_empty(prompt_line):
+        return False
+    return not _MENU_OPTION_RE.match(_prompt_body(prompt_line))
+
+
+def _has_numbered_options(content: str) -> bool:
+    """True when the pane shows a numbered option list ('1. Yes' / '2. No').
+
+    Every real Claude Code permission prompt renders one. Requiring it keeps
+    the digit responses from firing when Claude merely narrates a phrase like
+    "do you want to proceed" in its prose.
+    """
+    for line in content.split('\n'):
+        stripped = line.lstrip().lstrip('❯').strip()
+        if _MENU_OPTION_RE.match(stripped):
+            return True
+    return False
+
+
+def make_is_idle(target: str):
+    """Return True when the Claude session is idle: prompt visible, nothing
+    generating, and no draft in the input box.
+
+    Four checks:
+    1. ❯ prompt is visible at all
+    2. Claude isn't mid-turn (_GENERATING_MARKER absent)
+    3. The input box is empty, or holds only Claude's ghost hint
+    4. cursor_x <= 2 — cursor at the prompt, not out in typed text
+
+    Check 3 is deliberately NOT gated on cursor_x. It used to be (`cursor_x <
+    2`), on the theory that any text visible at cursor_x == 2 was the ghost
+    hint rather than user input. But an empty box renders as '❯\\xa0' with the
+    cursor already at column 2, so the check never ran — and the cursor sits at
+    column 2 with a real draft present whenever it is at the start of that
+    draft (Home/Ctrl-A, cursor navigation, a TUI repaint). Measured against
+    live panes, 13 of 19 running agents held one of Mek's drafts and still
+    reported idle, so claudio delivered and _submit() pressed Enter over his
+    half-written message. Pane content, not cursor position, is the signal that
+    survives; cursor_x is kept only as an additional way to say "not idle".
     """
     def is_idle() -> bool:
         content = pane_content(target)
 
-        has_prompt = any(line.lstrip().startswith('❯') for line in content.split('\n'))
-        if not has_prompt:
+        prompt_line = _last_prompt_line(content)
+        if prompt_line is None:
+            return False
+
+        if _GENERATING_MARKER in content.lower():
+            return False
+
+        if not _input_is_empty(prompt_line):
             return False
 
         result = subprocess.run(
@@ -111,25 +204,7 @@ def make_is_idle(target: str):
             cursor_x = int(result.stdout.strip())
         except ValueError:
             cursor_x = 0
-        if cursor_x > 2:
-            return False
-
-        # cursor_x == 2: cursor is at the ghost-hint position.
-        # Any text visible after ❯ is a Claude Code UI hint, not user input.
-        # Only check for typed text when cursor_x == 0 (Ctrl-A moves cursor
-        # to the very start while leaving typed text in the buffer).
-        if cursor_x < 2:
-            last_prompt = None
-            for line in content.split('\n'):
-                stripped = line.lstrip()
-                if stripped.startswith('❯'):
-                    last_prompt = stripped
-            if last_prompt is not None:
-                after = last_prompt[1:]
-                if after and after != '\xa0' and after.strip('\xa0') != '':
-                    return False  # Ctrl-A case: text in buffer
-
-        return True
+        return cursor_x <= 2
 
     return is_idle
 
@@ -192,7 +267,45 @@ def _inject_text(target: str, text: str) -> None:
         subprocess.run(['tmux', 'send-keys', '-t', target, '-l', text])
 
 
-def _submitted(target: str, text: str) -> bool:
+# Markers identifying Claude Code's status bar, which sits just below the input
+# box and changes on its own (spinner, token counter, 'esc to interrupt').
+# _input_box_text stops before it so that churn is never read as user typing.
+_STATUS_BAR_MARKERS = ('⏵⏵', 'esc to interrupt', 'for agents', 'for shortcuts')
+
+# Box-drawing characters Claude Code frames the input box with.
+_BOX_BORDER_CHARS = set('─│╭╮╰╯')
+
+
+def _input_box_text(content: str) -> str:
+    """The text currently sitting in the input box, whitespace-collapsed.
+
+    Starts at the last ❯ line and includes wrapped continuation rows, stopping
+    at the box's closing border, a blank line, or the status bar. Excluding the
+    status bar matters: it updates on its own while Claude works, and comparing
+    against it would look exactly like the user typing.
+    """
+    lines = content.split('\n')
+    prompt_idx = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith('❯'):
+            prompt_idx = i
+    if prompt_idx is None:
+        return ''
+
+    parts = [_prompt_body(lines[prompt_idx].lstrip())]
+    for line in lines[prompt_idx + 1:]:
+        stripped = line.strip()
+        if not stripped:
+            break
+        if set(stripped) <= _BOX_BORDER_CHARS:
+            break
+        if any(m in stripped for m in _STATUS_BAR_MARKERS):
+            break
+        parts.append(stripped)
+    return ' '.join(re.sub(r'\s+', ' ', p) for p in parts if p).strip()
+
+
+def _submitted_in(content: str, text: str) -> bool:
     """True once the injected text is no longer sitting in the input line.
 
     Checks the pane from the LAST ❯ prompt downward (the input box, including
@@ -202,7 +315,6 @@ def _submitted(target: str, text: str) -> bool:
     contain the probe either. If no prompt is visible at all (redraw, screen
     switch), report submitted rather than retry-looping blind.
     """
-    content = pane_content(target)
     lines = content.split('\n')
     prompt_idx = None
     for i, line in enumerate(lines):
@@ -215,6 +327,26 @@ def _submitted(target: str, text: str) -> bool:
     return probe not in input_region
 
 
+def _submitted(target: str, text: str) -> bool:
+    """Capture the pane and report whether `text` has left the input line."""
+    return _submitted_in(pane_content(target), text)
+
+
+def _input_grew_beyond(content: str, text: str) -> bool:
+    """True when the input box holds MORE than the text we injected.
+
+    That extra content is someone typing into the box while delivery is still
+    retrying. Compared against the injected text rather than a captured
+    baseline so the retry loop still needs only one pane capture per attempt.
+    """
+    box = _input_box_text(content)
+    if not box:
+        return False
+    if text[:24] not in box:
+        return False  # our text isn't in the box — submitted, or a redraw
+    return len(box) > len(re.sub(r'\s+', ' ', text).strip())
+
+
 def _submit(target: str, text: str) -> bool:
     """Press Enter until the injected text actually leaves the input line.
 
@@ -223,16 +355,30 @@ def _submit(target: str, text: str) -> bool:
     "submits or tells you it couldn't": each attempt presses Enter, waits
     (growing backoff — also lets a popup/paste window close), and re-checks
     the pane. Returns True on verified submission.
+
+    Bails out early if the input box grows beyond what was injected: that is
+    someone typing, and another Enter would submit their half-written text
+    merged with this message. Giving up is cheap — the stranded message is
+    picked up by _stuck_reconciler once the box settles — so a false bail costs
+    a short delay while a missed one costs Mek his sentence.
     """
     for attempt in range(_SUBMIT_RETRIES):
         subprocess.run(['tmux', 'send-keys', '-t', target, 'Enter'])
         time.sleep(0.4 + 0.3 * attempt)
-        if _submitted(target, text):
+        content = pane_content(target)
+        if _submitted_in(content, text):
             return True
+        if _input_grew_beyond(content, text):
+            print(
+                f'cmux: delivery paused — input box changed while submitting, '
+                f'someone is typing. Not pressing Enter again: {text[:80]!r}',
+                file=sys.stderr, flush=True,
+            )
+            return False
     return False
 
 
-def make_deliver(name: str, target: str):
+def make_deliver(name: str, target: str, in_flight: 'threading.Event | None' = None):
     home = os.path.join(STATE_DIR, name)
 
     def deliver(msg: dict) -> None:
@@ -252,11 +398,21 @@ def make_deliver(name: str, target: str):
         else:
             text = sanitize(f'{label}{body}')
 
-        _inject_text(target, text)
-        time.sleep(0.2)  # let the paste render before the first Enter
-        if not _submit(target, text):
+        # in_flight fences the stuck-delivery reconciler out of this window, so
+        # its Enter can never land on top of _submit()'s own Enter presses.
+        if in_flight is not None:
+            in_flight.set()
+        try:
+            _inject_text(target, text)
+            time.sleep(0.2)  # let the paste render before the first Enter
+            submitted = _submit(target, text)
+        finally:
+            if in_flight is not None:
+                in_flight.clear()
+        if not submitted:
             # Loud, greppable failure — the message text is preserved in the
             # input box (and, for long bodies, in the msg file), never lost.
+            # _stuck_reconciler picks it up from here.
             print(
                 f'cmux: DELIVERY STUCK for {name!r} — injected text did not '
                 f'submit after {_SUBMIT_RETRIES} Enter presses: {text[:80]!r}',
@@ -281,6 +437,98 @@ def make_deliver_file(name: str):
             f.write(_json.dumps(msg) + '\n')
 
     return deliver
+
+
+# Labels make_deliver() prefixes onto every injected message: '[cmux]: ' for
+# cmux itself, '[<sender>@cmux]: ' for a peer agent. Used to recognize cmux's
+# own text sitting in the input box — the one case where pressing Enter is
+# recovering a delivery rather than submitting something a human wrote.
+_CMUX_LABEL_RE = re.compile(r'^\[(cmux|[^\]]+@cmux)\]:')
+
+# Consecutive identical polls required before the reconciler treats the input
+# box as settled. Anything still changing is being actively written to.
+_RECONCILE_STABLE_POLLS = 3
+
+# Enter presses per distinct stuck message before giving up. A successful Enter
+# clears the box, so this only bites on a genuinely wedged pane — where
+# pressing Enter every poll forever would be noise, not recovery.
+_RECONCILE_MAX_ATTEMPTS = 2
+
+
+def _stuck_cmux_message(content: str) -> 'str | None':
+    """The cmux-injected message stranded in the input box, if any.
+
+    Returns None for an empty box, a ghost hint, a dialog option, or anything a
+    human typed — only cmux's own label-prefixed text qualifies.
+    """
+    prompt_line = _last_prompt_line(content)
+    if prompt_line is None:
+        return None
+    if _input_is_empty(prompt_line):
+        return None
+    body = _prompt_body(prompt_line)
+    return body if _CMUX_LABEL_RE.match(body) else None
+
+
+def _stuck_reconciler(name: str, target: str, interval: float = 5.0,
+                      stop_event: 'threading.Event | None' = None,
+                      in_flight: 'threading.Event | None' = None) -> None:
+    """Background thread: submit a cmux message left sitting in the input box.
+
+    _submit() presses Enter _SUBMIT_RETRIES times and then gives up, logging
+    DELIVERY STUCK and leaving the text in the box (seen in production on
+    'ada'). Before the draft guard existed, the next delivery pasted on top and
+    its Enter cleared the box — corrupting the two messages together, but
+    self-healing. The draft guard removes that path, so a stuck message would
+    otherwise sit there forever, and because is_idle() now reports a non-empty
+    box as busy, it would silently block every later message for that agent.
+
+    Pressing Enter from a background thread is exactly the pattern that caused
+    the cut-off-while-typing bug, so it is fenced in three ways:
+    - the box must hold cmux's own label-prefixed text and nothing else, so a
+      human draft can never qualify (_stuck_cmux_message)
+    - that text must be byte-identical across _RECONCILE_STABLE_POLLS polls, so
+      anything still being written to is left alone
+    - no delivery may be in flight, so it cannot double-submit by racing
+      _submit()'s own Enter presses
+    """
+    last_seen = None
+    stable = 0
+    attempts = {}
+
+    while stop_event is None or not stop_event.is_set():
+        time.sleep(interval)
+        if in_flight is not None and in_flight.is_set():
+            last_seen, stable = None, 0  # delivery running — restart the clock
+            continue
+        result = subprocess.run(
+            ['tmux', 'capture-pane', '-t', target, '-p'],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            continue
+
+        stuck = _stuck_cmux_message(result.stdout)
+        if stuck is None:
+            last_seen, stable = None, 0
+            continue
+
+        if stuck == last_seen:
+            stable += 1
+        else:
+            last_seen, stable = stuck, 1
+        if stable < _RECONCILE_STABLE_POLLS:
+            continue
+
+        if attempts.get(stuck, 0) >= _RECONCILE_MAX_ATTEMPTS:
+            continue
+        attempts[stuck] = attempts.get(stuck, 0) + 1
+        print(
+            f'cmux: recovering stuck delivery for {name!r} — pressing Enter on '
+            f'unsubmitted message: {stuck[:80]!r}',
+            file=sys.stderr, flush=True,
+        )
+        subprocess.run(['tmux', 'send-keys', '-t', target, 'Enter'], capture_output=True)
 
 
 def _unblock_watcher(name: str, target: str, interval: float = 1.5,
@@ -339,10 +587,23 @@ def _unblock_watcher(name: str, target: str, interval: float = 1.5,
         )
         if result.returncode != 0:
             continue
+
+        # Never send keys while there is a draft in the input box. Every
+        # dismiss path below is followed by Enter, which would submit whatever
+        # was being typed — the "I got cut off mid-sentence" report. A real
+        # dialog replaces the input box, so a draft being present means there
+        # is no dialog here to answer and nothing is lost by waiting.
+        if _has_user_draft(result.stdout):
+            continue
+
         pane_text = result.stdout.lower()
-        if any(pat in pane_text for pat in _ALLOW_SESSION_PATTERNS):
+        # The digit responses below pick an option by number, so require that
+        # numbered options are actually on screen. Without this, Claude merely
+        # writing "do you want to proceed" in its prose sends '1' + Enter.
+        has_options = _has_numbered_options(result.stdout)
+        if has_options and any(pat in pane_text for pat in _ALLOW_SESSION_PATTERNS):
             _send_and_notify('2')  # "Yes, allow for session"
-        elif any(pat in pane_text for pat in _APPROVE_ONCE_PATTERNS):
+        elif has_options and any(pat in pane_text for pat in _APPROVE_ONCE_PATTERNS):
             _send_and_notify('1')  # "Yes" on a 2-option prompt
         elif any(pat in pane_text for pat in _TRUST_DIALOG_PATTERNS):
             _trust_dialog_and_verify()  # "Yes, I trust this folder" — verified
@@ -382,13 +643,21 @@ def run(name: str, tmux_target: str = None, no_inject: bool = False, unblock: bo
     _check_singleton(name)
     if tmux_target is None:
         tmux_target = f'cmux-{name}:{name}'
+    in_flight = threading.Event()
     if no_inject:
         deliver = make_deliver_file(name)
         is_idle = lambda: True  # always ready to queue; delivery is non-blocking
     else:
-        deliver = make_deliver(name, tmux_target)
+        deliver = make_deliver(name, tmux_target, in_flight=in_flight)
         is_idle = make_is_idle(tmux_target)
     if not no_inject:
+        # Recovers a message that _submit() left unsubmitted in the input box.
+        # Without it, is_idle() correctly reports the non-empty box as busy and
+        # every later message for this agent queues behind it forever.
+        threading.Thread(
+            target=_stuck_reconciler, args=(name, tmux_target),
+            kwargs={'in_flight': in_flight}, daemon=True,
+        ).start()
         # Always run the unblock watcher — catches bypass permissions confirmation
         # and other permission prompts that appear during normal operation.
         # no_inject sessions don't use send-keys so the watcher would be a no-op.

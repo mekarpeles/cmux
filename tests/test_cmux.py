@@ -403,6 +403,28 @@ class TestCmdCheck(unittest.TestCase):
         output = self._run_check(pane_text)
         self.assertIn('[STUCK]', output)
 
+    def test_stuck_agent_detected_unsubmitted_cmux_message(self):
+        """An unsubmitted cmux message strands the agent just as thoroughly as
+        a permission prompt: is_idle() reports the non-empty box as busy, so
+        every later message queues behind it. Observed in production on 'ada'
+        (see DELIVERY STUCK in ada.daemon.log) while `cmux check` said [OK],
+        because the text matches neither _PERM_PATTERNS nor the trust dialog.
+        """
+        pane_text = _pane('❯\xa0[cmux]: @/Users/mek/.cmux/ada/msg-1785265823206.md')
+        output = self._run_check(pane_text)
+        self.assertIn('[STUCK]', output)
+
+    def test_user_draft_is_not_reported_stuck(self):
+        """Mek having something typed is normal, not a stalled agent."""
+        output = self._run_check(_pane('❯\xa0Build it as a dedicated new device'))
+        self.assertIn('[OK]', output)
+        self.assertNotIn('[STUCK]', output)
+
+    def test_empty_prompt_is_not_reported_stuck(self):
+        output = self._run_check(_pane('❯\xa0'))
+        self.assertIn('[OK]', output)
+        self.assertNotIn('[STUCK]', output)
+
 
 # ------------------------------------------------------------------
 # Unit tests for `cmux upgrade --testing [branch]`
@@ -1064,6 +1086,310 @@ class TestIsIdleOnTrustDialog(unittest.TestCase):
         with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
             is_idle = make_is_idle('cmux-trust-idle:test')
             self.assertFalse(is_idle(), 'trust dialog must never be reported as idle/ready')
+
+
+# ------------------------------------------------------------------
+# is_idle() must never report idle while Mek has a draft in the input box.
+#
+# The pane fixtures below are verbatim captures from real production agents
+# (mek:mekauth, ol-prs:ada) taken while diagnosing the "I got cut off while
+# typing" bug: a draft was sitting in the input box, cursor_x was 2, and
+# is_idle() returned True — so claudio delivered and _submit() pressed Enter
+# over Mek's half-written message.
+#
+# Root cause: the typed-text check was gated behind `cursor_x < 2`, but an
+# empty box renders as '❯\xa0' with the cursor at column 2, so the check
+# never ran. The cursor lands at column 2 with text present whenever it is
+# at the start of the draft (Home/Ctrl-A, cursor navigation, a TUI repaint).
+# ------------------------------------------------------------------
+
+def _pane(input_line, generating=False):
+    """Build a pane capture with Claude Code's real input-box framing."""
+    divider = '─' * 80
+    status = '  ⏵⏵ accept edits on (shift+tab to cycle)'
+    if generating:
+        status += ' · esc to interrupt'
+    status += ' · ← for agents'
+    return '\n'.join([
+        '✻ Worked for 8s',
+        '                    new task? /clear to save 310k tokens',
+        divider,
+        input_line,
+        divider,
+        status,
+        '',
+    ])
+
+
+def _idle_with(pane_text, cursor_x, target='cmux-draft:test'):
+    """Evaluate make_is_idle() against a fixed pane capture and cursor_x."""
+    from cmux_lib.daemon import make_is_idle
+
+    def mock_run(cmd, **kwargs):
+        result = MagicMock()
+        result.returncode = 0
+        cmd_list = list(cmd)
+        if 'capture-pane' in cmd_list:
+            result.stdout = pane_text
+        elif 'display-message' in cmd_list:
+            result.stdout = str(cursor_x)
+        return result
+
+    with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+        return make_is_idle(target)()
+
+
+class TestIsIdleWithUserDraft(unittest.TestCase):
+
+    def test_is_idle_false_with_draft_at_cursor_home(self):
+        """Verbatim mek:mekauth capture — draft present, cursor_x == 2."""
+        pane = _pane('❯\xa0Build it as a dedicated new device')
+        self.assertFalse(
+            _idle_with(pane, cursor_x=2),
+            'a draft in the input box must never be reported idle — '
+            'delivering here pastes over and submits Mek\'s typing',
+        )
+
+    def test_is_idle_false_with_draft_cursor_at_zero(self):
+        """Ctrl-A case: cursor jumps left of the prompt, text still buffered."""
+        pane = _pane('❯\xa0Build it as a dedicated new device')
+        self.assertFalse(_idle_with(pane, cursor_x=0))
+
+    def test_is_idle_false_with_wrapped_draft(self):
+        """A draft long enough to wrap leaves cursor_x small on the
+        continuation row; the continuation row has no ❯ of its own."""
+        pane = _pane('❯\xa0' + 'x' * 78 + '\nstill part of the same draft')
+        self.assertFalse(_idle_with(pane, cursor_x=2))
+
+    def test_is_idle_true_on_empty_input_box(self):
+        """The delivery path must stay open when the box is genuinely empty."""
+        pane = _pane('❯\xa0')
+        self.assertTrue(
+            _idle_with(pane, cursor_x=2),
+            'an empty input box is the normal delivery window — '
+            'blocking here would stop all message delivery',
+        )
+
+    def test_is_idle_true_with_ghost_hint(self):
+        """Claude Code paints a dim placeholder into an EMPTY box. It is not a
+        draft, and must not block delivery — this is why the cursor_x==2
+        exemption existed in the first place."""
+        pane = _pane('❯\xa0Try "write a test for <filepath>"')
+        self.assertTrue(
+            _idle_with(pane, cursor_x=2),
+            'ghost hint is placeholder text, not user input',
+        )
+
+    def test_is_idle_false_while_generating(self):
+        """The input box stays drawn while Claude works ('esc to interrupt' in
+        the status bar), so prompt-visibility alone is not idleness."""
+        pane = _pane('❯\xa0', generating=True)
+        self.assertFalse(
+            _idle_with(pane, cursor_x=2),
+            'mid-turn generation is not idle',
+        )
+
+
+# ------------------------------------------------------------------
+# The unblock watcher sends keys with no idle gate — by design, since it is
+# responding to whatever dialog is on screen right now. But it matched loose
+# substrings against the last 15 lines, which include Mek's own input box and
+# Claude's prose. A spurious match sends '1'/'2' + Enter, submitting whatever
+# was being typed. These lock in the two guards.
+# ------------------------------------------------------------------
+
+class TestUnblockWatcherRespectsUserDraft(unittest.TestCase):
+
+    def _run_watcher(self, pane_text, target):
+        from cmux_lib.daemon import _unblock_watcher
+        import threading
+
+        keys_sent = []
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ''
+            cmd_list = list(cmd)
+            if target not in cmd_list:
+                return result
+            if 'capture-pane' in cmd_list:
+                result.stdout = pane_text
+            elif 'send-keys' in cmd_list:
+                keys_sent.append(cmd_list)
+            return result
+
+        stop_event = threading.Event()
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+            t = threading.Thread(
+                target=_unblock_watcher, args=('test', target, 0.02, stop_event),
+                daemon=True,
+            )
+            t.start()
+            threading.Event().wait(timeout=0.3)  # ~15 poll iterations
+            stop_event.set()
+            t.join(timeout=2.0)
+        return keys_sent
+
+    def test_watcher_does_not_fire_on_user_draft(self):
+        """Mek typing a question that happens to contain a trigger phrase must
+        not get his own draft submitted out from under him."""
+        pane = _pane('❯\xa0do you want to run the tests in docker or locally?')
+        keys = self._run_watcher(pane, f'cmux-draft-guard-{_rnd()}:test')
+        self.assertEqual(
+            keys, [],
+            'watcher must send nothing while a user draft sits in the input box',
+        )
+
+    def test_watcher_ignores_trigger_phrase_in_claude_prose(self):
+        """Claude narrating 'do you want to proceed' is not a prompt. Real
+        permission prompts always render numbered options."""
+        pane = _pane('❯\xa0').replace(
+            '✻ Worked for 8s',
+            "I've staged the migration. Do you want to proceed with the rollout?",
+        )
+        keys = self._run_watcher(pane, f'cmux-prose-{_rnd()}:test')
+        self.assertEqual(
+            keys, [],
+            'a digit must only be sent when numbered options are actually on screen',
+        )
+
+    def test_watcher_still_answers_real_permission_prompt(self):
+        """The guards must not break the thing the watcher exists to do."""
+        pane = (
+            'Bash command\n\n'
+            '  rm -rf build/\n\n'
+            'Do you want to proceed?\n'
+            '❯ 1. Yes\n'
+            '  2. No, and tell Claude what to do differently\n'
+        )
+        keys = self._run_watcher(pane, f'cmux-real-prompt-{_rnd()}:test')
+        self.assertTrue(keys, 'a real numbered permission prompt must still be answered')
+        self.assertIn('1', keys[0], "should approve once with '1'")
+
+
+# ------------------------------------------------------------------
+# Stuck-delivery reconciler.
+#
+# _submit() gives up after _SUBMIT_RETRIES and logs DELIVERY STUCK, leaving the
+# message sitting in the input box (observed in production: ada.daemon.log).
+# Before the draft guard, the next delivery pasted on top and its Enter cleared
+# the box — corrupting both messages together, but self-healing. The draft
+# guard removes that path, so without a reconciler a stuck message blocks that
+# agent's queue forever.
+#
+# This thread presses Enter ONLY when the box holds a cmux-injected message and
+# nothing else, the text is byte-identical across consecutive polls (nobody is
+# typing), and no delivery is in flight (so it cannot race _submit's Enters).
+# ------------------------------------------------------------------
+
+class TestStuckReconciler(unittest.TestCase):
+
+    def _run(self, pane_texts, in_flight=None, polls=8):
+        """Run the reconciler against a sequence of pane captures.
+
+        pane_texts is either a list (each capture-pane consumes the next entry;
+        the last one repeats, i.e. the pane settles) or a callable taking the
+        poll number, for simulating text that never stops changing.
+        """
+        from cmux_lib.daemon import _stuck_reconciler
+        import threading
+        import itertools
+
+        keys_sent = []
+        target = f'cmux-stuck-{_rnd()}:test'
+        counter = itertools.count()
+        seq = None if callable(pane_texts) else list(pane_texts)
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ''
+            cmd_list = list(cmd)
+            if target not in cmd_list:
+                return result
+            if 'capture-pane' in cmd_list:
+                if seq is None:
+                    result.stdout = pane_texts(next(counter))
+                else:
+                    result.stdout = seq[0] if len(seq) == 1 else seq.pop(0)
+            elif 'send-keys' in cmd_list:
+                keys_sent.append(cmd_list)
+            return result
+
+        stop_event = threading.Event()
+        with patch('cmux_lib.daemon.subprocess.run', side_effect=mock_run):
+            t = threading.Thread(
+                target=_stuck_reconciler,
+                args=('test', target, 0.01, stop_event, in_flight),
+                daemon=True,
+            )
+            t.start()
+            threading.Event().wait(timeout=0.3)
+            stop_event.set()
+            t.join(timeout=2.0)
+        return keys_sent
+
+    def test_submits_stuck_cmux_message(self):
+        """A cmux message left in the box gets an Enter once it looks settled."""
+        pane = _pane('❯\xa0[cmux]: @/Users/mek/.cmux/ada/msg-1785265823206.md')
+        keys = self._run([pane])
+        self.assertTrue(keys, 'stuck cmux message must eventually be submitted')
+        self.assertEqual(keys[0][-1], 'Enter', 'recovery is a bare Enter — text is already in the box')
+
+    def test_submits_stuck_message_with_sender_label(self):
+        """Peer messages carry a '[name@cmux]:' label instead of '[cmux]:'."""
+        pane = _pane('❯\xa0[lupin@cmux]: please rebase onto main')
+        self.assertTrue(self._run([pane]), 'sender-labelled messages are also cmux-injected')
+
+    def test_ignores_user_draft(self):
+        """Mek's own typing must never be submitted by the reconciler."""
+        pane = _pane('❯\xa0Build it as a dedicated new device')
+        self.assertEqual(self._run([pane]), [], 'a user draft is not a stuck delivery')
+
+    def test_ignores_empty_box(self):
+        pane = _pane('❯\xa0')
+        self.assertEqual(self._run([pane]), [], 'nothing to recover from an empty box')
+
+    def test_waits_for_text_to_settle(self):
+        """Text still changing means something is actively writing to the pane;
+        pressing Enter mid-change is how the original bug happened."""
+        self.assertEqual(
+            self._run(lambda i: _pane(f'❯\xa0[cmux]: @/Users/mek/.cmux/ada/msg-{"1" * (i + 1)}.md')),
+            [], 'must not fire while the pane text is still changing',
+        )
+
+    def test_fires_once_text_stops_changing(self):
+        """The flip side: text that changes and then settles is a real stuck
+        delivery and must be recovered."""
+        changing = [_pane(f'❯\xa0[cmux]: @/Users/mek/.cmux/ada/msg-{"1" * (i + 1)}.md') for i in range(3)]
+        settled = _pane('❯\xa0[cmux]: @/Users/mek/.cmux/ada/msg-final.md')
+        self.assertTrue(
+            self._run(changing + [settled]),
+            'a settled stuck message must still be recovered',
+        )
+
+    def test_skips_while_delivery_in_flight(self):
+        """deliver()/_submit() is mid-flight and pressing its own Enters —
+        a second Enter here would submit twice."""
+        import threading
+        in_flight = threading.Event()
+        in_flight.set()
+        pane = _pane('❯\xa0[cmux]: @/Users/mek/.cmux/ada/msg-1785265823206.md')
+        self.assertEqual(
+            self._run([pane], in_flight=in_flight), [],
+            'must not race an in-flight delivery',
+        )
+
+    def test_gives_up_rather_than_pressing_enter_forever(self):
+        """A wedged pane that never clears must not get an Enter every poll
+        for the rest of the daemon's life."""
+        pane = _pane('❯\xa0[cmux]: @/Users/mek/.cmux/ada/msg-1785265823206.md')
+        keys = self._run([pane], polls=40)
+        self.assertLessEqual(
+            len(keys), 3,
+            f'reconciler should stop retrying a wedged pane, sent {len(keys)} Enters',
+        )
 
 
 # ------------------------------------------------------------------
@@ -2076,6 +2402,72 @@ class TestVerifiedDelivery(unittest.TestCase):
             ok = _daemon_module._submit('s:0', '[cmux]: probe-abc never leaves')
         self.assertFalse(ok)
         self.assertEqual(len(enters), _daemon_module._SUBMIT_RETRIES)
+
+    # --------------------------------------------------------------
+    # _submit() presses Enter up to _SUBMIT_RETRIES times over ~5s. If Mek
+    # starts typing inside that window, an Enter submits his half-written text
+    # merged with the cmux message. The retry loop must notice the input box
+    # growing beyond what was injected and stop pressing Enter — the stranded
+    # message is then recovered by _stuck_reconciler, so bailing out is cheap
+    # and a false bail is strictly safer than a missed one.
+    # --------------------------------------------------------------
+
+    def test_input_box_text_excludes_status_bar(self):
+        """The status bar changes on its own (spinner, token counts, 'esc to
+        interrupt'), so it must not count as the user typing."""
+        box = _daemon_module._input_box_text(_pane('❯\xa0[cmux]: hello', generating=True))
+        self.assertEqual(box, '[cmux]: hello')
+
+    def test_input_box_text_includes_wrapped_continuation(self):
+        box = _daemon_module._input_box_text(_pane('❯\xa0[cmux]: hello\nand the wrapped remainder'))
+        self.assertEqual(box, '[cmux]: hello and the wrapped remainder')
+
+    def test_submit_aborts_when_user_types_during_retries(self):
+        text = '[cmux]: probe-def please review'
+        stuck = _pane(f'❯\xa0{text}')
+        typed = _pane(f'❯\xa0{text} and now Mek is typing over it')
+        enters = []
+
+        def fake_run(cmd, **kw):
+            if 'send-keys' in cmd and 'Enter' in cmd:
+                enters.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch.object(_daemon_module.subprocess, 'run', side_effect=fake_run), \
+             patch.object(_daemon_module, 'pane_content', side_effect=[stuck, typed, typed, typed, typed]), \
+             patch.object(_daemon_module.time, 'sleep'):
+            ok = _daemon_module._submit('s:0', text)
+
+        self.assertFalse(ok, 'must report failure rather than submit over typed input')
+        self.assertEqual(
+            len(enters), 2,
+            'must stop pressing Enter the moment the input box grows — '
+            f'sent {len(enters)} Enters',
+        )
+
+    def test_submit_keeps_retrying_while_only_status_bar_changes(self):
+        """Guard against over-eager bailing: generation starting mid-delivery
+        changes the status bar, which is not Mek typing."""
+        text = '[cmux]: probe-ghi still stuck'
+        quiet = _pane(f'❯\xa0{text}')
+        busy = _pane(f'❯\xa0{text}', generating=True)
+        enters = []
+
+        def fake_run(cmd, **kw):
+            if 'send-keys' in cmd and 'Enter' in cmd:
+                enters.append(cmd)
+            return MagicMock(returncode=0)
+
+        with patch.object(_daemon_module.subprocess, 'run', side_effect=fake_run), \
+             patch.object(_daemon_module, 'pane_content', side_effect=[quiet, busy, quiet, busy, busy]), \
+             patch.object(_daemon_module.time, 'sleep'):
+            ok = _daemon_module._submit('s:0', text)
+
+        self.assertFalse(ok)
+        self.assertEqual(
+            len(enters), _daemon_module._SUBMIT_RETRIES,
+            'status-bar churn must not abort the retry loop',
+        )
 
     def test_deliver_short_message_injects_and_submits(self):
         seen = {'inject': None, 'submit': None}
