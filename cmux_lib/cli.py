@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -38,11 +39,31 @@ KNOWN_AGENTS = {
 # ------------------------------------------------------------------
 
 def load_registry():
+    if not os.path.exists(REGISTRY):
+        return {}
     try:
         with open(REGISTRY) as f:
             return json.load(f)
-    except Exception:
-        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        # The registry exists but is unreadable/corrupt. Do NOT silently treat
+        # it as empty — every command that reads this then writes it back
+        # would permanently erase every agent's session bookkeeping in one
+        # shot (this is exactly how sessions.json got wiped to `{}` during the
+        # 2026-07-23 incident). Back up the corrupt file so it can be
+        # inspected/recovered, and refuse to proceed rather than risk that.
+        import shutil as _shutil
+        backup = f'{REGISTRY}.corrupt-{int(time.time())}'
+        try:
+            _shutil.copy2(REGISTRY, backup)
+        except OSError:
+            backup = None
+        print(
+            f"cmux: sessions.json is corrupt ({e}) — refusing to treat it as empty.\n"
+            + (f"  Backed up to {backup}.\n" if backup else "")
+            + "  Fix or remove it manually before continuing.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def _parse_flags(args, kv=(), bools=()):
@@ -80,8 +101,13 @@ def _parse_flags(args, kv=(), bools=()):
 
 def save_registry(reg):
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(REGISTRY, 'w') as f:
+    # Write atomically: a crash or a concurrent read mid-write must never leave
+    # sessions.json truncated/partial, which load_registry() would otherwise
+    # have to treat as corrupt (see above) and refuse to proceed past.
+    tmp = f'{REGISTRY}.tmp-{os.getpid()}'
+    with open(tmp, 'w') as f:
         json.dump(reg, f, indent=2)
+    os.replace(tmp, REGISTRY)
 
 
 def _tmux_session(name, workspace=None):
@@ -275,15 +301,21 @@ def _store_session_id(home, pre_snapshot, project_dir=None, retries=None, retry_
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _inject_startup_context(name, home):
+def _inject_startup_context(name, home, is_first_start):
     """Inject exactly one startup message.
 
     Clone start (clone-source file present):
         name + home + source info + inline initial-prompt (if any) + @clone_readme.md
-    First start (no identity.md):
+    First start (is_first_start True — no session was known for this agent
+    before this cmd_start call):
         name + home + inline initial-prompt (if any) + @ONBOARDING + @IDENTITY_GUIDE
-    Subsequent starts:
+    Subsequent starts (resume):
         resume line + inline initial-prompt (if any)
+
+    is_first_start — not identity.md's presence — is the gate: several real
+    agents never get an identity.md seeded (no --identity was ever passed) but
+    are well past their first start, and would otherwise get the full
+    onboarding blast on every single resume.
 
     initial-prompt is inlined (not @file ref) so it's guaranteed delivered in the
     same injection — no file-reference parsing required for the user's prompt.
@@ -317,15 +349,17 @@ def _inject_startup_context(name, home):
 
     has_identity = os.path.exists(identity_path)
     parts = []
-    if not has_identity:
+    if is_first_start:
         parts.append(f'Session: "{name}" — home: {home}.')
-    else:
+    elif has_identity:
         parts.append(f'Resuming "{name}" (ref: {identity_path}).')
+    else:
+        parts.append(f'Resuming "{name}".')
 
     if prompt_text:
         parts.append(prompt_text)
 
-    if not has_identity:
+    if is_first_start:
         parts.append(f'@{os.path.join(_PKG_DIR, "ONBOARDING.md")}')
         parts.append(f'@{os.path.join(_PKG_DIR, "IDENTITY_GUIDE.md")}')
 
@@ -333,13 +367,19 @@ def _inject_startup_context(name, home):
 
 
 def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject=False,
-              unblock=False, allowed_tools=None, identity_path=None, from_session=None):
+              unblock=False, allowed_tools=None, identity_path=None, from_session=None,
+              force=False):
     """Start a new cmux session (window). Uses DB registration if available.
 
     from_session, when given, promotes an existing (externally-created) Claude
     session into this agent by resuming that session id instead of starting
     fresh — the rest of the startup procedure (tmux window, daemon, injected
     onboarding message) runs exactly as it does for a normal first start.
+
+    force, when True, allows from_session to overwrite an agent's existing,
+    still-valid tracked session with a different one. Without it, promoting
+    into an agent that already has different valid history is refused — see
+    the from_session block below for why.
     """
     # Fall back to DB registration for any unspecified args
     reg_info = db.get_agent(name)
@@ -430,6 +470,31 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         import shutil as _shutil
         _shutil.copy2(_migrate_src, _migrate_dst)
 
+    # Persist and reuse the agent's real working directory. Without this, every
+    # start/resume launches wherever `cmux up` happens to be invoked from — if
+    # that differs from where the agent's session actually lives, Claude can't
+    # find the session there and silently starts an unrelated fresh conversation
+    # in the wrong directory instead of resuming the real one. First start
+    # records the invoker's cwd as the agent's home; every later start reuses it
+    # regardless of where `cmux up` is run from.
+    cwd_path = os.path.join(home, 'cwd')
+    if os.path.exists(cwd_path):
+        agent_cwd = open(cwd_path).read().strip() or os.getcwd()
+        if not os.path.isdir(agent_cwd):
+            print(
+                f"cmux: warning — '{name}'s recorded directory no longer exists: {agent_cwd}\n"
+                f"  falling back to the current directory: {os.getcwd()}",
+                file=sys.stderr,
+            )
+            agent_cwd = os.getcwd()
+    else:
+        agent_cwd = os.getcwd()
+        try:
+            with open(cwd_path, 'w') as f:
+                f.write(agent_cwd)
+        except OSError:
+            pass
+
     claude_bin = os.environ.get('CMUX_CLAUDE_CMD', 'claude')
     # Use --resume <id> if we tracked the agent's last session, plain claude
     # on first start (no flags = new session, which we then track for next time).
@@ -458,12 +523,34 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
                 file=sys.stderr,
             )
             sys.exit(1)
+        # Refuse to silently clobber a different, still-valid tracked session.
+        # This exact mistake — testing -f against a real agent name and
+        # overwriting its actual history with an unrelated session — is what
+        # happened to the "ada" agent during the 2026-07-23 incident.
+        if stored_id and stored_id != from_session and not force:
+            print(
+                f"cmux: '{name}' already has a valid session tracked ({stored_id}) — "
+                f"refusing to overwrite it with '{from_session}' without --force.\n"
+                f"  If you really mean to replace it, re-run with --force.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         stored_id = from_session
         try:
             with open(session_id_path, 'w') as f:
                 f.write(stored_id)
         except OSError:
             pass
+
+    # True first start: no session was known for this agent before this call —
+    # not from the tracked file, not from -f. Only in this case do we need to
+    # auto-detect the session id Claude creates, by diffing the project
+    # directory before/after spawn (see _store_session_id). A resume already
+    # knows its session id, and diffing anyway is exactly how a resume that
+    # launches into a busy shared directory can clobber last-session-id with
+    # an unrelated session that merely has a newer mtime — this is precisely
+    # what happened to several agents during the 2026-07-23 incident.
+    _is_first_start = stored_id is None
 
     env_prefix = f'CMUX_SESSION_NAME={name} CLAUDIO_STATE_DIR={home}'
     allowed_tools_flag = f' --allowedTools {allowed_tools}' if allowed_tools else ''
@@ -472,25 +559,27 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
     else:
         claude_cmd = f'{env_prefix} {claude_bin}{allowed_tools_flag}'
 
-    # Scope session detection to the CWD we're launching from — avoids picking up
-    # other active Claude sessions as false positives.
-    _agent_cwd = os.getcwd()
-    _project_dir = _cwd_to_claude_project_dir(_agent_cwd)
-    _pre_sessions = _snapshot_claude_sessions(project_dir=_project_dir)
+    # Scope session detection to the agent's OWN directory (not necessarily the
+    # invoker's cwd) — avoids picking up other active Claude sessions in a
+    # different, shared directory as false positives. Only computed on a true
+    # first start — see _is_first_start above for why a resume skips this.
+    _project_dir = _cwd_to_claude_project_dir(agent_cwd)
+    _pre_sessions = _snapshot_claude_sessions(project_dir=_project_dir) if _is_first_start else {}
 
     sess_exists = subprocess.run(
         ['tmux', 'has-session', '-t', tmux_sess], capture_output=True
     ).returncode == 0
 
-    # -c pins the window to the caller's cwd. Without it, tmux windows inherit
-    # the SESSION's start directory — so an agent added to a long-lived
-    # workspace starts wherever the workspace was first created, not where
-    # `cmux up` was run. The cwd also determines which Claude Code project the
-    # agent belongs to (session detection + --resume are per-directory).
+    # -c pins the window to the agent's own recorded directory. Without it,
+    # tmux windows inherit the SESSION's start directory (or wherever `cmux up`
+    # happened to be invoked from) — so an agent could start somewhere that
+    # doesn't match where its session actually lives. agent_cwd also determines
+    # which Claude Code project the agent belongs to (session detection +
+    # --resume are per-directory).
     if not sess_exists:
         subprocess.run(
             ['tmux', 'new-session', '-d', '-s', tmux_sess, '-n', name,
-             '-c', os.getcwd(), claude_cmd],
+             '-c', agent_cwd, claude_cmd],
             check=True
         )
     else:
@@ -500,7 +589,7 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
             # its workspace), making tmux try to create at that occupied index
             # ("create window failed: index 0 in use").
             ['tmux', 'new-window', '-t', f'{tmux_sess}:', '-n', name,
-             '-c', os.getcwd(), claude_cmd],
+             '-c', agent_cwd, claude_cmd],
             check=True
         )
 
@@ -524,8 +613,41 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
         sys.exit(1)
 
     daemon_log = os.path.join(STATE_DIR, f'{name}.daemon.log')
+    daemon_pid_file = os.path.join(STATE_DIR, f'{name}.daemon.pid')
+    # Stop any daemon still running for this agent before starting a new one.
+    # Previously this just unlinked the pid file unconditionally — which erases
+    # the bookkeeping but never signals the OLD daemon process. It kept running
+    # orphaned forever, uncoordinated with whichever daemon started after it.
+    # Orphaned daemons accumulate indefinitely this way (7+ per agent observed
+    # for a single agent in the 2026-07-23 incident, one dating back days) and
+    # race each other injecting into the same tmux pane — the direct cause of
+    # duplicate permission-dismiss notices and similar corruption. Mirrors the
+    # same kill-by-pid cmd_stop already does correctly.
     try:
-        os.unlink(os.path.join(STATE_DIR, f'{name}.daemon.pid'))
+        old_daemon_pid = int(open(daemon_pid_file).read().strip())
+    except (FileNotFoundError, ValueError):
+        old_daemon_pid = None
+    if old_daemon_pid is not None:
+        try:
+            os.kill(old_daemon_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # already dead — nothing to clean up
+        else:
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                try:
+                    os.kill(old_daemon_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                print(
+                    f"cmux: warning — previous daemon for '{name}' (pid {old_daemon_pid}) "
+                    f"did not exit after SIGTERM within 3s; it may still be running",
+                    file=sys.stderr,
+                )
+    try:
+        os.unlink(daemon_pid_file)
     except FileNotFoundError:
         pass
     daemon_args = [sys.executable, '-m', 'cmux_lib.daemon', name, target]
@@ -582,12 +704,14 @@ def cmd_start(name, initial_prompt=None, detach=False, workspace=None, no_inject
 
     _wait_for_socket(reg[name]['socket'])
 
-    _inject_startup_context(name, home)
+    _inject_startup_context(name, home, _is_first_start)
 
     # Detect and store Claude session ID after message injection — JSONL is created
     # lazily (often after the first exchange), so checking immediately after socket
-    # ready misses it. Retries with delay until the file appears.
-    _store_session_id(home, _pre_sessions, project_dir=_project_dir)
+    # ready misses it. Retries with delay until the file appears. Only needed on
+    # a true first start — see _is_first_start above.
+    if _is_first_start:
+        _store_session_id(home, _pre_sessions, project_dir=_project_dir)
 
     # Inject workflow file if registered and readable.
     workflow_path = (reg_info.get('workflow_path') if reg_info else None)
@@ -1092,9 +1216,12 @@ Usage:
   cmux run "<system prompt>"                Ephemeral Claude session — no home dir, no history
   cmux [-s workspace] <agent>               Bring agent up and attach (shorthand)
   cmux [-s workspace] up <agent> [-d] [--no-inject] [--unblock] [--allowed-tools <tools>] [-i <path>] [-- "initial prompt"]
-  cmux -f <claude-session-id> <agent> [-d]  Promote an existing Claude session into <agent>
+  cmux -f <claude-session-id> <agent> [-d] [--force]
+                                             Promote an existing Claude session into <agent>
                                              (resumes that session id; run from the same cwd
-                                             it was started in — same as any --resume)
+                                             it was started in — same as any --resume).
+                                             Refuses to overwrite an agent's existing, different,
+                                             still-valid session unless --force is also given.
   cmux clone <source> <new-name> [-d] [--workspace <ws>] [--allowed-tools <tools>]
   cmux [-s workspace] down <agent>          Take agent offline (home dir preserved)
   cmux rm <agent>                           De-register agent from DB; home dir preserved (must be down first)
@@ -1333,7 +1460,9 @@ def main():
         detach = '-d' in args or '--detach' in args
         no_inject = '--no-inject' in args
         unblock = '--unblock' in args
-        flag_args = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject', '--unblock')]
+        force = '--force' in args
+        flag_args = [a for a in args[1:]
+                     if a not in ('-d', '--detach', '--no-inject', '--unblock', '--force')]
         # Normalise short flags so _parse_flags can handle them as kv pairs.
         flag_args = [{'--identity': '--identity', '-i': '--identity',
                       '--session': '--session', '-s': '--session'}.get(a, a)
@@ -1352,7 +1481,7 @@ def main():
                   no_inject=no_inject, unblock=unblock,
                   allowed_tools=sh_flags.get('allowed-tools'),
                   identity_path=sh_flags.get('identity'),
-                  from_session=from_session)
+                  from_session=from_session, force=force)
         return
 
     if cmd == 'start':
@@ -1362,7 +1491,9 @@ def main():
         detach = '-d' in args or '--detach' in args
         no_inject = '--no-inject' in args
         unblock = '--unblock' in args
-        flag_args = [a for a in args[1:] if a not in ('-d', '--detach', '--no-inject', '--unblock')]
+        force = '--force' in args
+        flag_args = [a for a in args[1:]
+                     if a not in ('-d', '--detach', '--no-inject', '--unblock', '--force')]
         flag_args = [{'--identity': '--identity', '-i': '--identity',
                       '--session': '--session', '-s': '--session'}.get(a, a)
                      for a in flag_args]
@@ -1381,7 +1512,7 @@ def main():
                   no_inject=no_inject, unblock=unblock,
                   allowed_tools=up_flags.get('allowed-tools'),
                   identity_path=up_flags.get('identity'),
-                  from_session=from_session)
+                  from_session=from_session, force=force)
 
     elif cmd == 'ls':
         cmd_ls()
